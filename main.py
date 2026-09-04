@@ -129,7 +129,7 @@ class StateBody(BaseModel):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "1.0.0"}
 
 
 @app.post("/api/login")
