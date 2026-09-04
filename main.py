@@ -94,6 +94,16 @@ SCHEMA_STATEMENTS = [
         updated_by TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS documents (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        source TEXT,
+        created_at TEXT NOT NULL,
+        created_by TEXT
+    )
+    """,
 ]
 
 
@@ -226,3 +236,75 @@ async def put_state(body: StateBody, username: str = Depends(get_current_usernam
         )
         await db.commit()
     return {"ok": True, "updated_at": now, "updated_by": username}
+
+
+# ── Knowledge base documents ──
+# Freight circulars, weekly reports, cargo-order lists, etc. that the broker
+# pastes in. Stored as plain rows (not part of the app_state JSON blob,
+# since they can be sizeable and are logically separate). The AI panel pulls
+# these in as extra context alongside mail search and web search.
+class DocumentBody(BaseModel):
+    title: str
+    content: str
+    source: Optional[str] = None
+
+
+@app.get("/api/documents")
+async def list_documents(username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(
+                text(
+                    "SELECT id, title, content, source, created_at, created_by "
+                    "FROM documents ORDER BY created_at DESC"
+                )
+            )
+        ).all()
+        return {
+            "documents": [
+                {
+                    "id": r.id,
+                    "title": r.title,
+                    "content": r.content,
+                    "source": r.source,
+                    "created_at": r.created_at,
+                    "created_by": r.created_by,
+                }
+                for r in rows
+            ]
+        }
+
+
+@app.post("/api/documents")
+async def create_document(body: DocumentBody, username: str = Depends(get_current_username)):
+    if not body.title.strip() or not body.content.strip():
+        raise HTTPException(status_code=400, detail="Title and content are required")
+    doc_id = secrets.token_urlsafe(12)
+    now = datetime.now(timezone.utc).isoformat()
+    async with SessionLocal() as db:
+        await db.execute(
+            text(
+                "INSERT INTO documents (id, title, content, source, created_at, created_by) "
+                "VALUES (:id, :t, :c, :s, :ca, :cb)"
+            ),
+            {
+                "id": doc_id,
+                "t": body.title.strip(),
+                "c": body.content,
+                "s": (body.source or "").strip() or None,
+                "ca": now,
+                "cb": username,
+            },
+        )
+        await db.commit()
+    return {"id": doc_id, "created_at": now}
+
+
+@app.delete("/api/documents/{doc_id}")
+async def delete_document(doc_id: str, username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        result = await db.execute(text("DELETE FROM documents WHERE id=:id"), {"id": doc_id})
+        await db.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Document not found")
+    return {"ok": True}
