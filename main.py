@@ -20,24 +20,34 @@ Design notes:
   clobbering each other's edits), the next step is splitting app_state
   into smaller documents (per cargo, per voyage) with per-document
   timestamps, or moving to proper row-level CRUD tables.
+- MCP server: exposes the board (and knowledge base) as tools any Claude
+  chat can call directly, mounted at /mcp on this same app. Auth is a
+  single static bearer token (separate from user login tokens), generated
+  on first run and stored in data/mcp_token.txt. This matches Claude.ai's
+  "None + Request headers" custom-connector auth mode — no OAuth needed.
 """
 import hashlib
 import hmac
 import json
 import os
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from starlette.responses import JSONResponse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "data", "dashboard.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "dashboard.db")
+MCP_TOKEN_PATH = os.path.join(DATA_DIR, "mcp_token.txt")
+os.makedirs(DATA_DIR, exist_ok=True)
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -57,15 +67,6 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:5500",
 ]
-
-app = FastAPI(title="CGL Indications API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
 
 SCHEMA_STATEMENTS = [
     """
@@ -107,14 +108,6 @@ SCHEMA_STATEMENTS = [
 ]
 
 
-@app.on_event("startup")
-async def on_startup():
-    async with engine.begin() as conn:
-        await conn.execute(text("PRAGMA journal_mode=WAL"))
-        for stmt in SCHEMA_STATEMENTS:
-            await conn.execute(text(stmt))
-
-
 # ── password hashing (stdlib only — no extra dependency needed) ──
 def hash_password(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
     if salt is None:
@@ -128,6 +121,262 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
     return hmac.compare_digest(dk.hex(), expected_hash)
 
 
+# ── shared app-state helpers (used by both the REST API and the MCP tools) ──
+async def load_app_state() -> dict:
+    async with SessionLocal() as db:
+        row = (await db.execute(text("SELECT value FROM kv_store WHERE key='app_state'"))).first()
+        return json.loads(row.value) if row else {}
+
+
+async def save_app_state(state: dict, actor: str) -> str:
+    now = datetime.now(timezone.utc).isoformat()
+    payload = json.dumps(state)
+    async with SessionLocal() as db:
+        await db.execute(
+            text(
+                """
+                INSERT INTO kv_store (key, value, updated_at, updated_by)
+                VALUES ('app_state', :v, :t, :u)
+                ON CONFLICT(key) DO UPDATE SET value=:v, updated_at=:t, updated_by=:u
+                """
+            ),
+            {"v": payload, "t": now, "u": actor},
+        )
+        await db.commit()
+    return now
+
+
+def today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%d.%m.%y")
+
+
+# ══════════════════════════════════════════════════════════
+# MCP server — same data, exposed as tools for any Claude chat
+# ══════════════════════════════════════════════════════════
+def _get_or_create_mcp_token() -> str:
+    if os.path.exists(MCP_TOKEN_PATH):
+        with open(MCP_TOKEN_PATH) as f:
+            existing = f.read().strip()
+            if existing:
+                return existing
+    token = secrets.token_urlsafe(32)
+    with open(MCP_TOKEN_PATH, "w") as f:
+        f.write(token)
+    os.chmod(MCP_TOKEN_PATH, 0o600)
+    return token
+
+
+MCP_TOKEN = _get_or_create_mcp_token()
+mcp_server = FastMCP("CGL Indications", stateless_http=True, streamable_http_path="/")
+
+
+@mcp_server.tool()
+async def get_board() -> dict:
+    """Get the full current freight indications board: every cargo type, its
+    directions/routes, current rate ranges (low/high/unit), direction
+    (outbound/backhaul), and owners/charterers idea notes with source+date."""
+    state = await load_app_state()
+    return state.get("board", {})
+
+
+@mcp_server.tool()
+async def list_cargo_types() -> dict:
+    """List every cargo type id and its display label currently on the board."""
+    state = await load_app_state()
+    board = state.get("board", {})
+    return {cid: c.get("label") for cid, c in board.get("cargoData", {}).items()}
+
+
+@mcp_server.tool()
+async def update_indication(
+    cargo_id: str,
+    route_id: str,
+    low: float,
+    high: float,
+    idea_type: str = "estimate",
+    note: str = "",
+    source: str = "",
+    date: str = "",
+) -> dict:
+    """Update the rate range on an existing direction/route, and optionally log
+    a new idea note (owners/charterers/estimate) with a source and date.
+    idea_type must be one of: 'owners', 'charterers', 'estimate'."""
+    state = await load_app_state()
+    board = state.setdefault("board", {})
+    cargo = board.get("cargoData", {}).get(cargo_id)
+    if not cargo:
+        return {"error": f"cargo_id '{cargo_id}' not found"}
+    route = next((r for r in cargo["routes"] if r["id"] == route_id), None)
+    if not route:
+        return {"error": f"route_id '{route_id}' not found under cargo '{cargo_id}'"}
+    route["low"], route["high"] = low, high
+    route["updatedAt"] = date or today_str()
+    if note:
+        bucket = "ownersIdeas" if idea_type == "owners" else ("charterersIdeas" if idea_type == "charterers" else "ownersIdeas")
+        entry_text = note + (" (estimate)" if idea_type == "estimate" else "")
+        route.setdefault(bucket, []).insert(0, {
+            "text": entry_text,
+            "source": source or "Claude (MCP)",
+            "date": date or today_str(),
+        })
+        route[bucket] = route[bucket][:6]
+    await save_app_state(state, "mcp-agent")
+    return {"ok": True, "route": route}
+
+
+@mcp_server.tool()
+async def add_route(cargo_id: str, label: str, direction: str, low: float, high: float, unit: str = "$/mt") -> dict:
+    """Add a new direction/route under an existing cargo type.
+    direction must be 'outbound' (ex-Ukraine export) or 'backhaul' (import into Ukraine/CVB)."""
+    state = await load_app_state()
+    board = state.setdefault("board", {})
+    cargo = board.get("cargoData", {}).get(cargo_id)
+    if not cargo:
+        return {"error": f"cargo_id '{cargo_id}' not found - call add_cargo first if this is a new cargo type"}
+    if direction not in ("outbound", "backhaul"):
+        return {"error": "direction must be 'outbound' or 'backhaul'"}
+    new_id = "r" + secrets.token_hex(6)
+    route = {
+        "id": new_id, "label": label, "direction": direction,
+        "low": low, "high": high, "unit": unit,
+        "ownersIdeas": [], "charterersIdeas": [], "updatedAt": today_str(),
+    }
+    cargo["routes"].append(route)
+    await save_app_state(state, "mcp-agent")
+    return {"ok": True, "route": route}
+
+
+@mcp_server.tool()
+async def add_cargo(cargo_id: str, label: str) -> dict:
+    """Create a new cargo type bucket on the board. cargo_id should be a short
+    lowercase slug (e.g. 'soybean'); label is the display name shown on the site."""
+    state = await load_app_state()
+    board = state.setdefault("board", {})
+    cargo_data = board.setdefault("cargoData", {})
+    if cargo_id in cargo_data:
+        return {"error": f"cargo_id '{cargo_id}' already exists"}
+    cargo_data[cargo_id] = {"label": label, "routes": []}
+    await save_app_state(state, "mcp-agent")
+    return {"ok": True, "cargo_id": cargo_id, "label": label}
+
+
+@mcp_server.tool()
+async def delete_route(cargo_id: str, route_id: str) -> dict:
+    """Delete a direction/route from a cargo type."""
+    state = await load_app_state()
+    board = state.setdefault("board", {})
+    cargo = board.get("cargoData", {}).get(cargo_id)
+    if not cargo:
+        return {"error": f"cargo_id '{cargo_id}' not found"}
+    before = len(cargo["routes"])
+    cargo["routes"] = [r for r in cargo["routes"] if r["id"] != route_id]
+    if len(cargo["routes"]) == before:
+        return {"error": f"route_id '{route_id}' not found under cargo '{cargo_id}'"}
+    await save_app_state(state, "mcp-agent")
+    return {"ok": True}
+
+
+@mcp_server.tool()
+async def add_note(text_: str) -> dict:
+    """Add a quick manual note to the dashboard's notes log (visible to everyone on the board)."""
+    state = await load_app_state()
+    board = state.setdefault("board", {})
+    notes = board.setdefault("notes", [])
+    notes.insert(0, {
+        "id": "nt" + secrets.token_hex(6),
+        "text": text_,
+        "ts": today_str() + " " + datetime.now(timezone.utc).strftime("%H:%M"),
+    })
+    board["notes"] = notes[:30]
+    await save_app_state(state, "mcp-agent")
+    return {"ok": True}
+
+
+@mcp_server.tool()
+async def list_documents_tool() -> list:
+    """List knowledge-base documents (freight reports/circulars) saved on the
+    dashboard, including their full text content."""
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(
+                text("SELECT id, title, content, source, created_at, created_by FROM documents ORDER BY created_at DESC")
+            )
+        ).all()
+        return [
+            {"id": r.id, "title": r.title, "content": r.content, "source": r.source,
+             "created_at": r.created_at, "created_by": r.created_by}
+            for r in rows
+        ]
+
+
+@mcp_server.tool()
+async def add_document_tool(title: str, content: str, source: str = "") -> dict:
+    """Save a new freight report/circular into the dashboard's knowledge base."""
+    if not title.strip() or not content.strip():
+        return {"error": "title and content are required"}
+    doc_id = secrets.token_urlsafe(12)
+    now = datetime.now(timezone.utc).isoformat()
+    async with SessionLocal() as db:
+        await db.execute(
+            text(
+                "INSERT INTO documents (id, title, content, source, created_at, created_by) "
+                "VALUES (:id, :t, :c, :s, :ca, :cb)"
+            ),
+            {"id": doc_id, "t": title.strip(), "c": content, "s": (source or "").strip() or None,
+             "ca": now, "cb": "mcp-agent"},
+        )
+        await db.commit()
+    return {"id": doc_id, "created_at": now}
+
+
+mcp_asgi_app = mcp_server.streamable_http_app()
+
+
+class MCPAuthMiddleware:
+    """Single static bearer token, checked on every request to the mounted MCP
+    app. Matches Claude.ai's custom-connector "None + Request headers" mode:
+    no OAuth handshake, just a fixed header value Claude attaches to every
+    call. Token lives in data/mcp_token.txt (see _get_or_create_mcp_token)."""
+
+    def __init__(self, wrapped_app, token: str):
+        self.wrapped_app = wrapped_app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers") or [])
+            auth = headers.get(b"authorization", b"").decode()
+            if auth != f"Bearer {self.token}":
+                response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                await response(scope, receive, send)
+                return
+        await self.wrapped_app(scope, receive, send)
+
+
+mcp_asgi_app_protected = MCPAuthMiddleware(mcp_asgi_app, MCP_TOKEN)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with mcp_server.session_manager.run():
+        async with engine.begin() as conn:
+            await conn.execute(text("PRAGMA journal_mode=WAL"))
+            for stmt in SCHEMA_STATEMENTS:
+                await conn.execute(text(stmt))
+        yield
+
+
+app = FastAPI(title="CGL Indications API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+app.mount("/mcp", mcp_asgi_app_protected)
+
+
 class LoginBody(BaseModel):
     username: str
     password: str
@@ -139,7 +388,7 @@ class StateBody(BaseModel):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "1.1.0"}
 
 
 @app.post("/api/login")
@@ -221,20 +470,7 @@ async def get_state(username: str = Depends(get_current_username)):
 
 @app.put("/api/state")
 async def put_state(body: StateBody, username: str = Depends(get_current_username)):
-    now = datetime.now(timezone.utc).isoformat()
-    payload = json.dumps(body.value)
-    async with SessionLocal() as db:
-        await db.execute(
-            text(
-                """
-                INSERT INTO kv_store (key, value, updated_at, updated_by)
-                VALUES ('app_state', :v, :t, :u)
-                ON CONFLICT(key) DO UPDATE SET value=:v, updated_at=:t, updated_by=:u
-                """
-            ),
-            {"v": payload, "t": now, "u": username},
-        )
-        await db.commit()
+    now = await save_app_state(body.value, username)
     return {"ok": True, "updated_at": now, "updated_by": username}
 
 
