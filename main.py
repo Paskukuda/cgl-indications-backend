@@ -167,7 +167,30 @@ def _get_or_create_mcp_token() -> str:
 
 
 MCP_TOKEN = _get_or_create_mcp_token()
-mcp_server = FastMCP("CGL Indications", stateless_http=True, streamable_http_path="/")
+# Allow the real public hostname through the MCP SDK's DNS-rebinding
+# protection (it only trusts localhost by default). Our own bearer-token
+# check below is the actual access control; this just lets legitimate
+# external requests (from Claude.ai) through in the first place.
+from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
+
+MCP_ALLOWED_HOSTS = [
+    "94-136-184-214.sslip.io",
+    "94-136-184-214.sslip.io:443",
+    "localhost",
+    "localhost:8090",
+    "127.0.0.1",
+    "127.0.0.1:8090",
+]
+mcp_server = FastMCP(
+    "CGL Indications",
+    stateless_http=True,
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=MCP_ALLOWED_HOSTS,
+        allowed_origins=["https://" + h for h in MCP_ALLOWED_HOSTS] + ["https://claude.ai"],
+    ),
+)
 
 
 @mcp_server.tool()
