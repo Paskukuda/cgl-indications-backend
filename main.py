@@ -316,6 +316,21 @@ async def add_note(text_: str) -> dict:
 
 
 @mcp_server.tool()
+async def delete_note(note_id: str) -> dict:
+    """Delete a note from the dashboard's notes log by its id (get the id from
+    get_board -> board.notes[].id)."""
+    state = await load_app_state()
+    board = state.setdefault("board", {})
+    notes = board.setdefault("notes", [])
+    before = len(notes)
+    board["notes"] = [n for n in notes if n.get("id") != note_id]
+    if len(board["notes"]) == before:
+        return {"error": f"note_id '{note_id}' not found"}
+    await save_app_state(state, "mcp-agent")
+    return {"ok": True}
+
+
+@mcp_server.tool()
 async def list_documents_tool() -> list:
     """List knowledge-base documents (freight reports/circulars) saved on the
     dashboard, including their full text content."""
@@ -350,6 +365,17 @@ async def add_document_tool(title: str, content: str, source: str = "") -> dict:
         )
         await db.commit()
     return {"id": doc_id, "created_at": now}
+
+
+@mcp_server.tool()
+async def delete_document_tool(doc_id: str) -> dict:
+    """Delete a knowledge-base document by its id (get the id from list_documents_tool)."""
+    async with SessionLocal() as db:
+        result = await db.execute(text("DELETE FROM documents WHERE id=:id"), {"id": doc_id})
+        await db.commit()
+        if result.rowcount == 0:
+            return {"error": f"doc_id '{doc_id}' not found"}
+    return {"ok": True}
 
 
 mcp_asgi_app = mcp_server.streamable_http_app()
