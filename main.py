@@ -101,10 +101,16 @@ SCHEMA_STATEMENTS = [
         title TEXT NOT NULL,
         content TEXT NOT NULL,
         source TEXT,
+        category TEXT,
         created_at TEXT NOT NULL,
         created_by TEXT
     )
     """,
+]
+
+# One-off migration for DBs created before the "category" column existed.
+MIGRATION_STATEMENTS = [
+    "ALTER TABLE documents ADD COLUMN category TEXT",
 ]
 
 
@@ -333,38 +339,46 @@ async def delete_note(note_id: str) -> dict:
 @mcp_server.tool()
 async def list_documents_tool() -> list:
     """List knowledge-base documents (freight reports/circulars) saved on the
-    dashboard, including their full text content."""
+    dashboard, including their full text content. Each document has a
+    category: 'general' (General Information), 'real' (Real data),
+    'claude_calc' (Claude calculation), or 'lumpsum' (Lumpsum calculation) —
+    this is what groups them under the site's "IND FAQ" view."""
     async with SessionLocal() as db:
         rows = (
             await db.execute(
-                text("SELECT id, title, content, source, created_at, created_by FROM documents ORDER BY created_at DESC")
+                text("SELECT id, title, content, source, category, created_at, created_by FROM documents ORDER BY created_at DESC")
             )
         ).all()
         return [
             {"id": r.id, "title": r.title, "content": r.content, "source": r.source,
-             "created_at": r.created_at, "created_by": r.created_by}
+             "category": normalize_category(r.category), "created_at": r.created_at, "created_by": r.created_by}
             for r in rows
         ]
 
 
 @mcp_server.tool()
-async def add_document_tool(title: str, content: str, source: str = "") -> dict:
-    """Save a new freight report/circular into the dashboard's knowledge base."""
+async def add_document_tool(title: str, content: str, source: str = "", category: str = "general") -> dict:
+    """Save a new freight report/circular into the dashboard's knowledge base.
+    category must be one of: 'general' (General Information), 'real' (Real
+    data), 'claude_calc' (Claude calculation), 'lumpsum' (Lumpsum
+    calculation) — this groups it under the site's "IND FAQ" view. Defaults
+    to 'general' if omitted or unrecognized."""
     if not title.strip() or not content.strip():
         return {"error": "title and content are required"}
     doc_id = secrets.token_urlsafe(12)
     now = datetime.now(timezone.utc).isoformat()
+    cat = normalize_category(category)
     async with SessionLocal() as db:
         await db.execute(
             text(
-                "INSERT INTO documents (id, title, content, source, created_at, created_by) "
-                "VALUES (:id, :t, :c, :s, :ca, :cb)"
+                "INSERT INTO documents (id, title, content, source, category, created_at, created_by) "
+                "VALUES (:id, :t, :c, :s, :cat, :ca, :cb)"
             ),
             {"id": doc_id, "t": title.strip(), "c": content, "s": (source or "").strip() or None,
-             "ca": now, "cb": "mcp-agent"},
+             "cat": cat, "ca": now, "cb": "mcp-agent"},
         )
         await db.commit()
-    return {"id": doc_id, "created_at": now}
+    return {"id": doc_id, "created_at": now, "category": cat}
 
 
 @mcp_server.tool()
@@ -412,6 +426,11 @@ async def lifespan(app: FastAPI):
             await conn.execute(text("PRAGMA journal_mode=WAL"))
             for stmt in SCHEMA_STATEMENTS:
                 await conn.execute(text(stmt))
+            for stmt in MIGRATION_STATEMENTS:
+                try:
+                    await conn.execute(text(stmt))
+                except Exception:
+                    pass  # column already exists (older DB already migrated)
         yield
 
 
@@ -528,10 +547,20 @@ async def put_state(body: StateBody, username: str = Depends(get_current_usernam
 # pastes in. Stored as plain rows (not part of the app_state JSON blob,
 # since they can be sizeable and are logically separate). The AI panel pulls
 # these in as extra context alongside mail search and web search.
+# category buckets the "IND FAQ" view on the dashboard groups documents into.
+VALID_DOC_CATEGORIES = {"general", "real", "claude_calc", "lumpsum"}
+
+
+def normalize_category(cat: Optional[str]) -> str:
+    c = (cat or "").strip().lower()
+    return c if c in VALID_DOC_CATEGORIES else "general"
+
+
 class DocumentBody(BaseModel):
     title: str
     content: str
     source: Optional[str] = None
+    category: Optional[str] = None
 
 
 @app.get("/api/documents")
@@ -540,7 +569,7 @@ async def list_documents(username: str = Depends(get_current_username)):
         rows = (
             await db.execute(
                 text(
-                    "SELECT id, title, content, source, created_at, created_by "
+                    "SELECT id, title, content, source, category, created_at, created_by "
                     "FROM documents ORDER BY created_at DESC"
                 )
             )
@@ -552,6 +581,7 @@ async def list_documents(username: str = Depends(get_current_username)):
                     "title": r.title,
                     "content": r.content,
                     "source": r.source,
+                    "category": normalize_category(r.category),
                     "created_at": r.created_at,
                     "created_by": r.created_by,
                 }
@@ -566,23 +596,25 @@ async def create_document(body: DocumentBody, username: str = Depends(get_curren
         raise HTTPException(status_code=400, detail="Title and content are required")
     doc_id = secrets.token_urlsafe(12)
     now = datetime.now(timezone.utc).isoformat()
+    category = normalize_category(body.category)
     async with SessionLocal() as db:
         await db.execute(
             text(
-                "INSERT INTO documents (id, title, content, source, created_at, created_by) "
-                "VALUES (:id, :t, :c, :s, :ca, :cb)"
+                "INSERT INTO documents (id, title, content, source, category, created_at, created_by) "
+                "VALUES (:id, :t, :c, :s, :cat, :ca, :cb)"
             ),
             {
                 "id": doc_id,
                 "t": body.title.strip(),
                 "c": body.content,
                 "s": (body.source or "").strip() or None,
+                "cat": category,
                 "ca": now,
                 "cb": username,
             },
         )
         await db.commit()
-    return {"id": doc_id, "created_at": now}
+    return {"id": doc_id, "created_at": now, "category": category}
 
 
 @app.delete("/api/documents/{doc_id}")
