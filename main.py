@@ -392,6 +392,40 @@ async def delete_document_tool(doc_id: str) -> dict:
     return {"ok": True}
 
 
+@mcp_server.tool()
+async def update_document_tool(
+    doc_id: str,
+    title: Optional[str] = None,
+    content: Optional[str] = None,
+    source: Optional[str] = None,
+    category: Optional[str] = None,
+) -> dict:
+    """Update an existing knowledge-base document (get the id from
+    list_documents_tool). Only the fields you pass are changed — leave the
+    rest as None to keep them as-is. category must be one of: 'general'
+    (General Information), 'real' (Real data), 'claude_calc' (Claude
+    calculation), 'lumpsum' (Lumpsum calculation)."""
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(
+                text("SELECT id, title, content, source, category FROM documents WHERE id=:id"),
+                {"id": doc_id},
+            )
+        ).first()
+        if not row:
+            return {"error": f"doc_id '{doc_id}' not found"}
+        new_title = title.strip() if (title is not None and title.strip()) else row.title
+        new_content = content if (content is not None and content.strip()) else row.content
+        new_source = (source.strip() if source is not None else row.source) or None
+        new_category = normalize_category(category) if category is not None else normalize_category(row.category)
+        await db.execute(
+            text("UPDATE documents SET title=:t, content=:c, source=:s, category=:cat WHERE id=:id"),
+            {"t": new_title, "c": new_content, "s": new_source, "cat": new_category, "id": doc_id},
+        )
+        await db.commit()
+    return {"ok": True, "id": doc_id, "title": new_title, "category": new_category}
+
+
 mcp_asgi_app = mcp_server.streamable_http_app()
 
 
@@ -615,6 +649,36 @@ async def create_document(body: DocumentBody, username: str = Depends(get_curren
         )
         await db.commit()
     return {"id": doc_id, "created_at": now, "category": category}
+
+
+class DocumentUpdateBody(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+    source: Optional[str] = None
+    category: Optional[str] = None
+
+
+@app.put("/api/documents/{doc_id}")
+async def update_document(doc_id: str, body: DocumentUpdateBody, username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(
+                text("SELECT id, title, content, source, category FROM documents WHERE id=:id"),
+                {"id": doc_id},
+            )
+        ).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found")
+        new_title = body.title.strip() if (body.title is not None and body.title.strip()) else row.title
+        new_content = body.content if (body.content is not None and body.content.strip()) else row.content
+        new_source = (body.source.strip() if body.source is not None else row.source) or None
+        new_category = normalize_category(body.category) if body.category is not None else normalize_category(row.category)
+        await db.execute(
+            text("UPDATE documents SET title=:t, content=:c, source=:s, category=:cat WHERE id=:id"),
+            {"t": new_title, "c": new_content, "s": new_source, "cat": new_category, "id": doc_id},
+        )
+        await db.commit()
+    return {"ok": True, "id": doc_id, "title": new_title, "category": new_category}
 
 
 @app.delete("/api/documents/{doc_id}")
