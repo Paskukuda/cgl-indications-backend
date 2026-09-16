@@ -433,21 +433,67 @@ class MCPAuthMiddleware:
     """Single static bearer token, checked on every request to the mounted MCP
     app. Matches Claude.ai's custom-connector "None + Request headers" mode:
     no OAuth handshake, just a fixed header value Claude attaches to every
-    call. Token lives in data/mcp_token.txt (see _get_or_create_mcp_token)."""
+    call. Token lives in data/mcp_token.txt (see _get_or_create_mcp_token).
+
+    Claude.ai's connector UI does its own connectivity/discovery probe
+    (an MCP "initialize" call, and sometimes "tools/list") *before* it
+    treats the connector as usable, and — even in "No sign-in" mode — a
+    401 on that probe makes the UI report the whole server as
+    unreachable rather than just "auth failed". So low-sensitivity
+    discovery methods (which reveal only protocol/tool names+schemas, no
+    actual board/document data) are let through without the token; any
+    real data-touching call (tools/call, resources, etc.) still requires
+    it."""
+
+    UNAUTH_METHODS = {"initialize", "notifications/initialized", "tools/list", "ping"}
 
     def __init__(self, wrapped_app, token: str):
         self.wrapped_app = wrapped_app
         self.token = token
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            headers = dict(scope.get("headers") or [])
-            auth = headers.get(b"authorization", b"").decode()
-            if auth != f"Bearer {self.token}":
-                response = JSONResponse({"error": "unauthorized"}, status_code=401)
-                await response(scope, receive, send)
-                return
-        await self.wrapped_app(scope, receive, send)
+        if scope["type"] != "http":
+            await self.wrapped_app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        auth = headers.get(b"authorization", b"").decode()
+        if auth == f"Bearer {self.token}":
+            await self.wrapped_app(scope, receive, send)
+            return
+
+        # Not authorized as-is — buffer the body so we can inspect the
+        # JSON-RPC method, then replay it to the wrapped app either way.
+        body_chunks = []
+        more_body = True
+        while more_body:
+            message = await receive()
+            body_chunks.append(message.get("body", b""))
+            more_body = message.get("more_body", False)
+        body = b"".join(body_chunks)
+
+        method = None
+        try:
+            payload = json.loads(body or b"{}")
+            method = payload.get("method")
+        except Exception:
+            method = None
+
+        if method not in self.UNAUTH_METHODS:
+            response = JSONResponse({"error": "unauthorized"}, status_code=401)
+            await response(scope, receive, send)
+            return
+
+        sent = False
+
+        async def replay_receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.wrapped_app(scope, replay_receive, send)
 
 
 mcp_asgi_app_protected = MCPAuthMiddleware(mcp_asgi_app, MCP_TOKEN)
