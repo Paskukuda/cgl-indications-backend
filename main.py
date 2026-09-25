@@ -122,6 +122,9 @@ SCHEMA_STATEMENTS = [
         ais_type TEXT,
         manual_type TEXT,
         dwt REAL,
+        manual_dwt REAL,
+        loa REAL,
+        max_draught REAL,
         lat REAL,
         lon REAL,
         sog REAL,
@@ -200,6 +203,9 @@ def nearest_port(lat, lon):
 # One-off migration for DBs created before the "category" column existed.
 MIGRATION_STATEMENTS = [
     "ALTER TABLE documents ADD COLUMN category TEXT",
+    "ALTER TABLE vessels ADD COLUMN manual_dwt REAL",
+    "ALTER TABLE vessels ADD COLUMN loa REAL",
+    "ALTER TABLE vessels ADD COLUMN max_draught REAL",
 ]
 
 
@@ -266,7 +272,7 @@ async def upsert_vessel_position(imo, mmsi, lat, lon, sog, ts):
         await db.commit()
 
 
-async def upsert_vessel_static(imo, mmsi, name, ais_type, dwt):
+async def upsert_vessel_static(imo, mmsi, name, ais_type, loa, max_draught):
     if not imo:
         return
     now = datetime.now(timezone.utc).isoformat()
@@ -274,15 +280,17 @@ async def upsert_vessel_static(imo, mmsi, name, ais_type, dwt):
         await db.execute(
             text(
                 """
-                INSERT INTO vessels (imo, mmsi, name, ais_type, dwt, updated_at)
-                VALUES (:imo, :mmsi, :name, :ais_type, :dwt, :now)
+                INSERT INTO vessels (imo, mmsi, name, ais_type, loa, max_draught, updated_at)
+                VALUES (:imo, :mmsi, :name, :ais_type, :loa, :draught, :now)
                 ON CONFLICT(imo) DO UPDATE SET
                     mmsi=COALESCE(:mmsi, mmsi), name=COALESCE(:name, name),
-                    ais_type=COALESCE(:ais_type, ais_type), dwt=COALESCE(:dwt, dwt),
+                    ais_type=COALESCE(:ais_type, ais_type), loa=COALESCE(:loa, loa),
+                    max_draught=COALESCE(:draught, max_draught),
                     updated_at=:now
                 """
             ),
-            {"imo": str(imo), "mmsi": str(mmsi) if mmsi else None, "name": name, "ais_type": ais_type, "dwt": dwt, "now": now},
+            {"imo": str(imo), "mmsi": str(mmsi) if mmsi else None, "name": name, "ais_type": ais_type,
+             "loa": loa, "draught": max_draught, "now": now},
         )
         await db.commit()
 
@@ -330,10 +338,11 @@ async def ais_worker():
                         name = (body.get("Name") or meta.get("ShipName") or "").strip() or None
                         ais_type = body.get("Type")
                         dims = body.get("Dimension") or {}
-                        length = (dims.get("A", 0) or 0) + (dims.get("B", 0) or 0)
-                        dwt = None  # AISStream static data doesn't include DWT directly
+                        a, b = dims.get("A"), dims.get("B")
+                        loa = (a + b) if (a is not None and b is not None) else None
+                        max_draught = body.get("MaximumStaticDraught")
                         if imo and str(imo) not in ("0", "None"):
-                            await upsert_vessel_static(imo, mmsi, name, str(ais_type) if ais_type is not None else None, dwt)
+                            await upsert_vessel_static(imo, mmsi, name, str(ais_type) if ais_type is not None else None, loa, max_draught)
         except Exception as e:
             logger.warning("AIS worker disconnected (%s) — retrying in %ss", e, backoff)
             await asyncio.sleep(backoff)
@@ -611,17 +620,20 @@ async def update_document_tool(
 
 
 @mcp_server.tool()
-async def find_vessels_near(lat: float, lon: float, radius_nm: float = 30) -> dict:
+async def find_vessels_near(lat: float, lon: float, radius_nm: float = 30, cargo_only: bool = True) -> dict:
     """Find open vessels from the live AIS feed within radius_nm nautical
-    miles of a point (e.g. a load port). Returns each vessel's IMO, MMSI,
-    name, AIS-reported type (plus any manually-corrected type), position,
-    nearest reference port + distance to it, and how long ago it was last
-    seen. IMPORTANT: this is a physical-presence signal only, not
-    confirmation that the vessel is open/available — always say so when
-    relaying results, and prefer cross-checking a candidate against a
-    broker circular (mail) or a direct check before treating it as a real
-    candidate."""
-    vessels = await query_vessels_near(lat, lon, radius_nm)
+    miles of a point (e.g. a load port). cargo_only=True (default) filters
+    to AIS type codes 70-79 (cargo/bulk-type traffic) so yachts, passenger
+    and other irrelevant vessel types the feed also picks up are excluded
+    — set False to see everything. Returns each vessel's IMO, MMSI, name,
+    AIS-reported type (plus any manually-corrected type), DWT if it's been
+    recorded, LOA/draught from AIS, position, nearest reference port +
+    distance to it, and how long ago it was last seen. IMPORTANT: this is
+    a physical-presence signal only, not confirmation that the vessel is
+    open/available — always say so when relaying results, and prefer
+    cross-checking a candidate against a broker circular (mail) or a
+    direct check before treating it as a real candidate."""
+    vessels = await query_vessels_near(lat, lon, radius_nm, cargo_only=cargo_only)
     return {"vessels": vessels, "disclaimer": AIS_DISCLAIMER}
 
 
@@ -662,6 +674,22 @@ async def set_vessel_manual_type_tool(imo: str, manual_type: str) -> dict:
     flagged against — the AIS-reported type on the dashboard and in lookups."""
     async with SessionLocal() as db:
         result = await db.execute(text("UPDATE vessels SET manual_type=:t WHERE imo=:imo"), {"t": manual_type, "imo": str(imo)})
+        await db.commit()
+        if result.rowcount == 0:
+            return {"error": f"no AIS data for IMO {imo} yet — it must appear in the AIS feed at least once before you can annotate it"}
+    return {"ok": True}
+
+
+@mcp_server.tool()
+async def set_vessel_dwt(imo: str, dwt: float) -> dict:
+    """Record a vessel's deadweight tonnage (DWT) by IMO. Raw AIS never
+    carries DWT — it's registry data — so use this after looking the
+    vessel up on a free public source (e.g. Equasis, MagicPort) or from
+    the broker's own vessel database, and it'll show on the dashboard's
+    AIS/Vessels tab from then on. The vessel must already have appeared in
+    the AIS feed at least once (i.e. have a row) before you can annotate it."""
+    async with SessionLocal() as db:
+        result = await db.execute(text("UPDATE vessels SET manual_dwt=:d WHERE imo=:imo"), {"d": dwt, "imo": str(imo)})
         await db.commit()
         if result.rowcount == 0:
             return {"error": f"no AIS data for IMO {imo} yet — it must appear in the AIS feed at least once before you can annotate it"}
@@ -996,6 +1024,15 @@ AIS_DISCLAIMER = (
 )
 
 
+def is_cargo_type(ais_type):
+    """AIS type codes 70-79 are the 'Cargo' category (includes bulk
+    carriers, general cargo, etc.) — coarse, but enough to filter out
+    yachts/passenger/tanker/fishing traffic the AIS feed also picks up.
+    Unknown type (static data not received yet) is excluded from the
+    default cargo-only view until it's classified."""
+    return bool(ais_type) and ais_type.strip().startswith("7")
+
+
 def _vessel_row_to_dict(r):
     lat, lon = r.lat, r.lon
     port_name, port_dist = nearest_port(lat, lon)
@@ -1013,17 +1050,21 @@ def _vessel_row_to_dict(r):
     return {
         "imo": r.imo, "mmsi": r.mmsi, "name": r.name,
         "ais_type": r.ais_type, "manual_type": r.manual_type, "type_mismatch": type_mismatch,
-        "dwt": r.dwt, "lat": lat, "lon": lon,
+        "dwt": r.manual_dwt,  # only ever set manually/imported — AIS itself carries no DWT field
+        "loa": r.loa, "max_draught": r.max_draught,
+        "lat": lat, "lon": lon,
         "nearest_port": port_name, "distance_nm": port_dist,
         "last_seen": r.last_seen, "stale": is_stale,
     }
 
 
-async def query_vessels_near(lat, lon, radius_nm, limit=25):
+async def query_vessels_near(lat, lon, radius_nm, limit=25, cargo_only=True):
     async with SessionLocal() as db:
         rows = (await db.execute(text("SELECT * FROM vessels WHERE lat IS NOT NULL AND lon IS NOT NULL"))).all()
     out = []
     for r in rows:
+        if cargo_only and not is_cargo_type(r.ais_type):
+            continue
         d = haversine_nm(lat, lon, r.lat, r.lon)
         if d <= radius_nm:
             v = _vessel_row_to_dict(r)
@@ -1034,21 +1075,30 @@ async def query_vessels_near(lat, lon, radius_nm, limit=25):
 
 
 @app.get("/api/vessels")
-async def list_vessels(username: str = Depends(get_current_username)):
+async def list_vessels(all_types: bool = False, username: str = Depends(get_current_username)):
     async with SessionLocal() as db:
         rows = (await db.execute(text("SELECT * FROM vessels ORDER BY updated_at DESC"))).all()
+    if not all_types:
+        rows = [r for r in rows if is_cargo_type(r.ais_type)]
     return {"vessels": [_vessel_row_to_dict(r) for r in rows], "disclaimer": AIS_DISCLAIMER}
 
 
-class VesselTypeBody(BaseModel):
+class VesselAnnotateBody(BaseModel):
     manual_type: Optional[str] = None
+    manual_dwt: Optional[float] = None
 
 
 @app.put("/api/vessels/{imo}/type")
-async def set_vessel_manual_type(imo: str, body: VesselTypeBody, username: str = Depends(get_current_username)):
+async def set_vessel_manual_type(imo: str, body: VesselAnnotateBody, username: str = Depends(get_current_username)):
     async with SessionLocal() as db:
-        result = await db.execute(text("UPDATE vessels SET manual_type=:t WHERE imo=:imo"), {"t": body.manual_type, "imo": imo})
-        await db.commit()
-        if result.rowcount == 0:
+        row = (await db.execute(text("SELECT imo, manual_type, manual_dwt FROM vessels WHERE imo=:imo"), {"imo": imo})).first()
+        if not row:
             raise HTTPException(status_code=404, detail="Vessel not found")
+        new_type = body.manual_type if body.manual_type is not None else row.manual_type
+        new_dwt = body.manual_dwt if body.manual_dwt is not None else row.manual_dwt
+        await db.execute(
+            text("UPDATE vessels SET manual_type=:t, manual_dwt=:d WHERE imo=:imo"),
+            {"t": new_type, "d": new_dwt, "imo": imo},
+        )
+        await db.commit()
     return {"ok": True}
