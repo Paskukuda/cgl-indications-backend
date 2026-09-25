@@ -29,12 +29,17 @@ Design notes:
 import hashlib
 import hmac
 import json
+import logging
+import math
 import os
 import secrets
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
+import websockets
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
@@ -44,6 +49,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.responses import JSONResponse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+AISSTREAM_API_KEY = os.environ.get("AISSTREAM_API_KEY")
+logger = logging.getLogger("cgl.ais")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "dashboard.db")
 MCP_TOKEN_PATH = os.path.join(DATA_DIR, "mcp_token.txt")
@@ -106,7 +114,88 @@ SCHEMA_STATEMENTS = [
         created_by TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS vessels (
+        imo TEXT PRIMARY KEY,
+        mmsi TEXT,
+        name TEXT,
+        ais_type TEXT,
+        manual_type TEXT,
+        dwt REAL,
+        lat REAL,
+        lon REAL,
+        sog REAL,
+        last_seen TEXT,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_vessels_mmsi ON vessels (mmsi)
+    """,
 ]
+
+# ── AIS region of interest (Black Sea + Azov + lower Danube + Mediterranean
+# + Red Sea) — the broker's usual working area. AISStream wants
+# [[lat_min, lon_min], [lat_max, lon_max]] boxes; kept as a couple of
+# rectangles rather than one huge box so the subscription stays reasonably
+# tight (fewer irrelevant vessels streamed).
+AIS_BOUNDING_BOXES = [
+    [[40.0, 27.0], [47.5, 42.0]],   # Black Sea + Azov + Danube mouth
+    [[30.0, -6.0], [46.0, 27.0]],   # Mediterranean
+    [[12.0, 32.0], [30.0, 43.5]],   # Red Sea
+]
+
+# Reference ports used for "nearest port" / distance-to-port on the AIS tab —
+# the load/discharge ports that already appear on the rate board.
+REFERENCE_PORTS = [
+    ("Izmail", 45.3547, 28.8419),
+    ("Reni", 45.4547, 28.2444),
+    ("Kiliya", 45.4517, 29.2669),
+    ("Orlivka", 45.4064, 29.5219),
+    ("Giurgiulesti", 45.4589, 28.1897),
+    ("Constanta", 44.1733, 28.6383),
+    ("Galati", 45.4353, 28.0453),
+    ("Braila", 45.2692, 27.9575),
+    ("Marmara (Istanbul)", 41.0082, 28.9784),
+    ("Bandirma", 40.3500, 27.9667),
+    ("Samsun", 41.2867, 36.3300),
+    ("Mersin", 36.8000, 34.6333),
+    ("Iskenderun", 36.5833, 36.1667),
+    ("Poti", 42.1500, 41.6667),
+    ("EC Greece (Thessaloniki)", 40.6403, 22.9439),
+    ("WC Greece (Patras)", 38.2466, 21.7346),
+    ("Famagusta", 35.1167, 33.9500),
+    ("Beirut", 33.9000, 35.5167),
+    ("Tartus", 34.8833, 35.8833),
+    ("Alexandria", 31.2001, 29.9187),
+    ("El Arish", 31.1300, 33.8000),
+    ("Egypt Med (Damietta)", 31.4167, 31.8167),
+    ("Tunisia (Sfax)", 34.7333, 10.7333),
+    ("EC Italy (Bari)", 41.1333, 16.8667),
+    ("Spain Med (Valencia)", 39.4667, -0.3167),
+    ("Aqaba", 29.5267, 35.0078),
+    ("Gdansk", 54.3667, 18.6667),
+]
+
+
+def haversine_nm(lat1, lon1, lat2, lon2):
+    r_nm = 3440.065  # earth radius in nautical miles
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return r_nm * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def nearest_port(lat, lon):
+    if lat is None or lon is None:
+        return None, None
+    best_name, best_dist = None, None
+    for name, plat, plon in REFERENCE_PORTS:
+        d = haversine_nm(lat, lon, plat, plon)
+        if best_dist is None or d < best_dist:
+            best_name, best_dist = name, d
+    return best_name, round(best_dist, 1) if best_dist is not None else None
 
 # One-off migration for DBs created before the "category" column existed.
 MIGRATION_STATEMENTS = [
@@ -154,6 +243,101 @@ async def save_app_state(state: dict, actor: str) -> str:
 
 def today_str() -> str:
     return datetime.now(timezone.utc).strftime("%d.%m.%y")
+
+
+# ── AIS: vessel upserts + the background AISStream worker ──
+async def upsert_vessel_position(imo, mmsi, lat, lon, sog, ts):
+    if not imo:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    async with SessionLocal() as db:
+        await db.execute(
+            text(
+                """
+                INSERT INTO vessels (imo, mmsi, lat, lon, sog, last_seen, updated_at)
+                VALUES (:imo, :mmsi, :lat, :lon, :sog, :ts, :now)
+                ON CONFLICT(imo) DO UPDATE SET
+                    mmsi=COALESCE(:mmsi, mmsi), lat=:lat, lon=:lon, sog=:sog,
+                    last_seen=:ts, updated_at=:now
+                """
+            ),
+            {"imo": str(imo), "mmsi": str(mmsi) if mmsi else None, "lat": lat, "lon": lon, "sog": sog, "ts": ts, "now": now},
+        )
+        await db.commit()
+
+
+async def upsert_vessel_static(imo, mmsi, name, ais_type, dwt):
+    if not imo:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    async with SessionLocal() as db:
+        await db.execute(
+            text(
+                """
+                INSERT INTO vessels (imo, mmsi, name, ais_type, dwt, updated_at)
+                VALUES (:imo, :mmsi, :name, :ais_type, :dwt, :now)
+                ON CONFLICT(imo) DO UPDATE SET
+                    mmsi=COALESCE(:mmsi, mmsi), name=COALESCE(:name, name),
+                    ais_type=COALESCE(:ais_type, ais_type), dwt=COALESCE(:dwt, dwt),
+                    updated_at=:now
+                """
+            ),
+            {"imo": str(imo), "mmsi": str(mmsi) if mmsi else None, "name": name, "ais_type": ais_type, "dwt": dwt, "now": now},
+        )
+        await db.commit()
+
+
+async def ais_worker():
+    """Holds one persistent WebSocket to aisstream.io for the broker's
+    working region and upserts every position/static-data message into the
+    vessels table. Runs for the lifetime of the app; reconnects with
+    backoff on any drop. No-ops (logs once) if no API key is configured."""
+    if not AISSTREAM_API_KEY:
+        logger.warning("AISSTREAM_API_KEY not set — AIS worker disabled.")
+        return
+    backoff = 5
+    while True:
+        try:
+            async with websockets.connect("wss://stream.aisstream.io/v0/stream", ping_interval=20, ping_timeout=20) as ws:
+                subscribe = {
+                    "APIKey": AISSTREAM_API_KEY,
+                    "BoundingBoxes": AIS_BOUNDING_BOXES,
+                    "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
+                }
+                await ws.send(json.dumps(subscribe))
+                logger.info("AIS worker connected and subscribed.")
+                backoff = 5
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    mtype = msg.get("MessageType")
+                    meta = msg.get("MetaData", {}) or {}
+                    mmsi = meta.get("MMSI")
+                    ts = meta.get("time_utc") or datetime.now(timezone.utc).isoformat()
+                    if mtype == "PositionReport":
+                        body = msg.get("Message", {}).get("PositionReport", {}) or {}
+                        imo = body.get("ImoNumber") or meta.get("IMO")
+                        lat = body.get("Latitude", meta.get("latitude"))
+                        lon = body.get("Longitude", meta.get("longitude"))
+                        sog = body.get("Sog")
+                        if imo and str(imo) not in ("0", "None"):
+                            await upsert_vessel_position(imo, mmsi, lat, lon, sog, ts)
+                    elif mtype == "ShipStaticData":
+                        body = msg.get("Message", {}).get("ShipStaticData", {}) or {}
+                        imo = body.get("ImoNumber")
+                        name = (body.get("Name") or meta.get("ShipName") or "").strip() or None
+                        ais_type = body.get("Type")
+                        dims = body.get("Dimension") or {}
+                        length = (dims.get("A", 0) or 0) + (dims.get("B", 0) or 0)
+                        dwt = None  # AISStream static data doesn't include DWT directly
+                        if imo and str(imo) not in ("0", "None"):
+                            await upsert_vessel_static(imo, mmsi, name, str(ais_type) if ais_type is not None else None, dwt)
+        except Exception as e:
+            logger.warning("AIS worker disconnected (%s) — retrying in %ss", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)
 
 
 # ══════════════════════════════════════════════════════════
@@ -426,6 +610,64 @@ async def update_document_tool(
     return {"ok": True, "id": doc_id, "title": new_title, "category": new_category}
 
 
+@mcp_server.tool()
+async def find_vessels_near(lat: float, lon: float, radius_nm: float = 30) -> dict:
+    """Find open vessels from the live AIS feed within radius_nm nautical
+    miles of a point (e.g. a load port). Returns each vessel's IMO, MMSI,
+    name, AIS-reported type (plus any manually-corrected type), position,
+    nearest reference port + distance to it, and how long ago it was last
+    seen. IMPORTANT: this is a physical-presence signal only, not
+    confirmation that the vessel is open/available — always say so when
+    relaying results, and prefer cross-checking a candidate against a
+    broker circular (mail) or a direct check before treating it as a real
+    candidate."""
+    vessels = await query_vessels_near(lat, lon, radius_nm)
+    return {"vessels": vessels, "disclaimer": AIS_DISCLAIMER}
+
+
+@mcp_server.tool()
+async def get_vessel_by_imo(imo: str) -> dict:
+    """Look up one vessel's latest known AIS position/static data by IMO
+    number (the reliable identifier — never match vessels by name alone,
+    since many are near-duplicates, e.g. the Sormovskiy-type series).
+    Same physical-presence-only caveat as find_vessels_near applies."""
+    async with SessionLocal() as db:
+        row = (await db.execute(text("SELECT * FROM vessels WHERE imo=:imo"), {"imo": str(imo)})).first()
+    if not row:
+        return {"error": f"no AIS data for IMO {imo}"}
+    v = _vessel_row_to_dict(row)
+    v["disclaimer"] = AIS_DISCLAIMER
+    return v
+
+
+@mcp_server.tool()
+async def get_vessel_by_mmsi(mmsi: str) -> dict:
+    """Look up one vessel's latest known AIS position/static data by MMSI.
+    Same physical-presence-only caveat as find_vessels_near applies."""
+    async with SessionLocal() as db:
+        row = (await db.execute(text("SELECT * FROM vessels WHERE mmsi=:mmsi ORDER BY updated_at DESC"), {"mmsi": str(mmsi)})).first()
+    if not row:
+        return {"error": f"no AIS data for MMSI {mmsi}"}
+    v = _vessel_row_to_dict(row)
+    v["disclaimer"] = AIS_DISCLAIMER
+    return v
+
+
+@mcp_server.tool()
+async def set_vessel_manual_type_tool(imo: str, manual_type: str) -> dict:
+    """Manually correct a vessel's cargo/hull type when AIS's own type field
+    is wrong (known failure mode — e.g. MV JOE 1, IMO 8714114, is AIS-typed
+    as a container ship but is actually a bulker/general cargo vessel per
+    real circulars). This manual value is then shown alongside — and
+    flagged against — the AIS-reported type on the dashboard and in lookups."""
+    async with SessionLocal() as db:
+        result = await db.execute(text("UPDATE vessels SET manual_type=:t WHERE imo=:imo"), {"t": manual_type, "imo": str(imo)})
+        await db.commit()
+        if result.rowcount == 0:
+            return {"error": f"no AIS data for IMO {imo} yet — it must appear in the AIS feed at least once before you can annotate it"}
+    return {"ok": True}
+
+
 mcp_asgi_app = mcp_server.streamable_http_app()
 
 
@@ -511,7 +753,15 @@ async def lifespan(app: FastAPI):
                     await conn.execute(text(stmt))
                 except Exception:
                     pass  # column already exists (older DB already migrated)
-        yield
+        ais_task = asyncio.create_task(ais_worker())
+        try:
+            yield
+        finally:
+            ais_task.cancel()
+            try:
+                await ais_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(title="CGL Indications API", lifespan=lifespan)
@@ -734,4 +984,71 @@ async def delete_document(doc_id: str, username: str = Depends(get_current_usern
         await db.commit()
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Document not found")
+    return {"ok": True}
+
+
+# ── AIS / vessels ──
+STALE_HOURS = 6
+AIS_DISCLAIMER = (
+    "AIS shows physical presence near a port, not confirmed open tonnage. "
+    "Treat as a candidate only — confirm via a broker circular (mail) or a direct check "
+    "before treating the vessel as available."
+)
+
+
+def _vessel_row_to_dict(r):
+    lat, lon = r.lat, r.lon
+    port_name, port_dist = nearest_port(lat, lon)
+    is_stale = None
+    if r.last_seen:
+        try:
+            last_dt = datetime.fromisoformat(r.last_seen.replace("Z", "+00:00"))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600.0
+            is_stale = age_hours > STALE_HOURS
+        except Exception:
+            is_stale = None
+    type_mismatch = bool(r.manual_type and r.ais_type and r.manual_type != r.ais_type)
+    return {
+        "imo": r.imo, "mmsi": r.mmsi, "name": r.name,
+        "ais_type": r.ais_type, "manual_type": r.manual_type, "type_mismatch": type_mismatch,
+        "dwt": r.dwt, "lat": lat, "lon": lon,
+        "nearest_port": port_name, "distance_nm": port_dist,
+        "last_seen": r.last_seen, "stale": is_stale,
+    }
+
+
+async def query_vessels_near(lat, lon, radius_nm, limit=25):
+    async with SessionLocal() as db:
+        rows = (await db.execute(text("SELECT * FROM vessels WHERE lat IS NOT NULL AND lon IS NOT NULL"))).all()
+    out = []
+    for r in rows:
+        d = haversine_nm(lat, lon, r.lat, r.lon)
+        if d <= radius_nm:
+            v = _vessel_row_to_dict(r)
+            v["distance_from_query_nm"] = round(d, 1)
+            out.append(v)
+    out.sort(key=lambda v: v["distance_from_query_nm"])
+    return out[:limit]
+
+
+@app.get("/api/vessels")
+async def list_vessels(username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        rows = (await db.execute(text("SELECT * FROM vessels ORDER BY updated_at DESC"))).all()
+    return {"vessels": [_vessel_row_to_dict(r) for r in rows], "disclaimer": AIS_DISCLAIMER}
+
+
+class VesselTypeBody(BaseModel):
+    manual_type: Optional[str] = None
+
+
+@app.put("/api/vessels/{imo}/type")
+async def set_vessel_manual_type(imo: str, body: VesselTypeBody, username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        result = await db.execute(text("UPDATE vessels SET manual_type=:t WHERE imo=:imo"), {"t": body.manual_type, "imo": imo})
+        await db.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Vessel not found")
     return {"ok": True}
