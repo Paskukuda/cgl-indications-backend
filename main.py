@@ -125,6 +125,8 @@ SCHEMA_STATEMENTS = [
         manual_dwt REAL,
         loa REAL,
         max_draught REAL,
+        destination TEXT,
+        eta TEXT,
         lat REAL,
         lon REAL,
         sog REAL,
@@ -206,6 +208,8 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE vessels ADD COLUMN manual_dwt REAL",
     "ALTER TABLE vessels ADD COLUMN loa REAL",
     "ALTER TABLE vessels ADD COLUMN max_draught REAL",
+    "ALTER TABLE vessels ADD COLUMN destination TEXT",
+    "ALTER TABLE vessels ADD COLUMN eta TEXT",
 ]
 
 
@@ -297,7 +301,28 @@ async def upsert_vessel_position(imo_hint, mmsi, lat, lon, sog, ts):
         await db.commit()
 
 
-async def upsert_vessel_static(imo, mmsi, name, ais_type, loa, max_draught):
+def format_ais_eta(eta_obj):
+    """AIS ETA is Month/Day/Hour/Minute with no year (20-bit field per
+    ITU-R M.1371) — AISStream hands it back as an object. Month=0 or Day=0
+    means "not available" per spec, not January 0th."""
+    if not eta_obj or not isinstance(eta_obj, dict):
+        return None
+    month = eta_obj.get("Month", eta_obj.get("month"))
+    day = eta_obj.get("Day", eta_obj.get("day"))
+    hour = eta_obj.get("Hour", eta_obj.get("hour"))
+    minute = eta_obj.get("Minute", eta_obj.get("minute"))
+    try:
+        month, day = int(month), int(day)
+        if month == 0 or day == 0:
+            return None
+        hour = int(hour) if hour is not None else 0
+        minute = int(minute) if minute is not None else 0
+        return f"{day:02d}.{month:02d} {hour:02d}:{minute:02d}"
+    except (TypeError, ValueError):
+        return None
+
+
+async def upsert_vessel_static(imo, mmsi, name, ais_type, loa, max_draught, destination=None, eta=None):
     if not imo:
         return
     now = datetime.now(timezone.utc).isoformat()
@@ -305,17 +330,18 @@ async def upsert_vessel_static(imo, mmsi, name, ais_type, loa, max_draught):
         await db.execute(
             text(
                 """
-                INSERT INTO vessels (imo, mmsi, name, ais_type, loa, max_draught, updated_at)
-                VALUES (:imo, :mmsi, :name, :ais_type, :loa, :draught, :now)
+                INSERT INTO vessels (imo, mmsi, name, ais_type, loa, max_draught, destination, eta, updated_at)
+                VALUES (:imo, :mmsi, :name, :ais_type, :loa, :draught, :dest, :eta, :now)
                 ON CONFLICT(imo) DO UPDATE SET
                     mmsi=COALESCE(:mmsi, mmsi), name=COALESCE(:name, name),
                     ais_type=COALESCE(:ais_type, ais_type), loa=COALESCE(:loa, loa),
                     max_draught=COALESCE(:draught, max_draught),
+                    destination=COALESCE(:dest, destination), eta=COALESCE(:eta, eta),
                     updated_at=:now
                 """
             ),
             {"imo": str(imo), "mmsi": str(mmsi) if mmsi else None, "name": name, "ais_type": ais_type,
-             "loa": loa, "draught": max_draught, "now": now},
+             "loa": loa, "draught": max_draught, "dest": destination, "eta": eta, "now": now},
         )
         await db.commit()
 
@@ -367,8 +393,10 @@ async def ais_worker():
                             a, b = dims.get("A"), dims.get("B")
                             loa = (a + b) if (a is not None and b is not None) else None
                             max_draught = body.get("MaximumStaticDraught")
+                            destination = sanitize_text(body.get("Destination"))
+                            eta = format_ais_eta(body.get("Eta"))
                             if imo and str(imo) not in ("0", "None"):
-                                await upsert_vessel_static(imo, mmsi, name, str(ais_type) if ais_type is not None else None, loa, max_draught)
+                                await upsert_vessel_static(imo, mmsi, name, str(ais_type) if ais_type is not None else None, loa, max_draught, destination, eta)
                     except Exception as msg_err:
                         logger.warning("AIS worker: skipping one bad message (%s)", msg_err)
                         continue
@@ -658,9 +686,15 @@ async def find_vessels_near(lat: float, lon: float, radius_nm: float = 30, cargo
     AIS-reported type (plus any manually-corrected type), DWT if it's been
     recorded, LOA/draught from AIS, position, nearest reference port +
     distance to it, and how long ago it was last seen, plus speed over
-    ground (sog) with a derived 'underway' flag (>0.5kn) — a vessel
-    sitting near 0 knots close to a port is a much stronger "possibly
-    waiting for cargo" signal than one passing through at speed. IMPORTANT: this is
+    ground (sog) with a derived 'underway' flag (>0.5kn), and any
+    self-reported destination/ETA from the crew (dd.mm hh:mm, no year) —
+    useful for spotting a vessel already heading toward this exact port
+    (it may become open once it discharges there), but destination/ETA is
+    crew-entered free text and often stale/wrong, so treat it as a hint,
+    not a fact. A vessel near 0 knots close to a port is a stronger
+    "possibly waiting for cargo" signal than one passing through at speed —
+    but a vessel underway AND reporting this port as its destination is
+    also a good candidate (arriving soon). IMPORTANT: this is
     a physical-presence signal only, not confirmation that the vessel is
     open/available — always say so when relaying results, and prefer
     cross-checking a candidate against a broker circular (mail) or a
@@ -1085,6 +1119,7 @@ def _vessel_row_to_dict(r):
         "ais_type": r.ais_type, "manual_type": r.manual_type, "type_mismatch": type_mismatch,
         "dwt": r.manual_dwt,  # only ever set manually/imported — AIS itself carries no DWT field
         "loa": r.loa, "max_draught": r.max_draught,
+        "destination": r.destination, "eta": r.eta,
         "lat": lat, "lon": lon, "sog": r.sog, "underway": is_underway,
         "nearest_port": port_name, "distance_nm": port_dist,
         "last_seen": r.last_seen, "stale": is_stale,
