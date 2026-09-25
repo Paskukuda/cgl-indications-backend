@@ -657,7 +657,10 @@ async def find_vessels_near(lat: float, lon: float, radius_nm: float = 30, cargo
     — set False to see everything. Returns each vessel's IMO, MMSI, name,
     AIS-reported type (plus any manually-corrected type), DWT if it's been
     recorded, LOA/draught from AIS, position, nearest reference port +
-    distance to it, and how long ago it was last seen. IMPORTANT: this is
+    distance to it, and how long ago it was last seen, plus speed over
+    ground (sog) with a derived 'underway' flag (>0.5kn) — a vessel
+    sitting near 0 knots close to a port is a much stronger "possibly
+    waiting for cargo" signal than one passing through at speed. IMPORTANT: this is
     a physical-presence signal only, not confirmation that the vessel is
     open/available — always say so when relaying results, and prefer
     cross-checking a candidate against a broker circular (mail) or a
@@ -1076,12 +1079,13 @@ def _vessel_row_to_dict(r):
         except Exception:
             is_stale = None
     type_mismatch = bool(r.manual_type and r.ais_type and r.manual_type != r.ais_type)
+    is_underway = (r.sog is not None and r.sog > 0.5) if r.sog is not None else None
     return {
         "imo": r.imo, "mmsi": r.mmsi, "name": r.name,
         "ais_type": r.ais_type, "manual_type": r.manual_type, "type_mismatch": type_mismatch,
         "dwt": r.manual_dwt,  # only ever set manually/imported — AIS itself carries no DWT field
         "loa": r.loa, "max_draught": r.max_draught,
-        "lat": lat, "lon": lon,
+        "lat": lat, "lon": lon, "sog": r.sog, "underway": is_underway,
         "nearest_port": port_name, "distance_nm": port_dist,
         "last_seen": r.last_seen, "stale": is_stale,
     }
