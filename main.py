@@ -264,11 +264,24 @@ def sanitize_text(s):
     return s.encode("utf-8", "ignore").decode("utf-8").strip() or None
 
 
-async def upsert_vessel_position(imo, mmsi, lat, lon, sog, ts):
-    if not imo:
+async def upsert_vessel_position(imo_hint, mmsi, lat, lon, sog, ts):
+    """Position reports (AIS types 1/2/3) carry MMSI but never IMO — IMO
+    only arrives via a separate ShipStaticData message (type 5), sent much
+    less often. So: use imo_hint if the message happened to carry one
+    (rare), otherwise resolve this MMSI to the IMO already on file from an
+    earlier static-data message. If we don't know this vessel's IMO yet at
+    all, skip for now — its position will start recording as soon as its
+    static data comes through (usually within a few minutes)."""
+    if not mmsi:
         return
     now = datetime.now(timezone.utc).isoformat()
     async with SessionLocal() as db:
+        imo = str(imo_hint) if imo_hint and str(imo_hint) not in ("0", "None") else None
+        if not imo:
+            row = (await db.execute(text("SELECT imo FROM vessels WHERE mmsi=:mmsi"), {"mmsi": str(mmsi)})).first()
+            if not row:
+                return
+            imo = row.imo
         await db.execute(
             text(
                 """
@@ -279,7 +292,7 @@ async def upsert_vessel_position(imo, mmsi, lat, lon, sog, ts):
                     last_seen=:ts, updated_at=:now
                 """
             ),
-            {"imo": str(imo), "mmsi": str(mmsi) if mmsi else None, "lat": lat, "lon": lon, "sog": sog, "ts": ts, "now": now},
+            {"imo": imo, "mmsi": str(mmsi), "lat": lat, "lon": lon, "sog": sog, "ts": ts, "now": now},
         )
         await db.commit()
 
@@ -339,12 +352,12 @@ async def ais_worker():
                         ts = meta.get("time_utc") or datetime.now(timezone.utc).isoformat()
                         if mtype == "PositionReport":
                             body = msg.get("Message", {}).get("PositionReport", {}) or {}
-                            imo = body.get("ImoNumber") or meta.get("IMO")
+                            imo_hint = body.get("ImoNumber") or meta.get("IMO")
                             lat = body.get("Latitude", meta.get("latitude"))
                             lon = body.get("Longitude", meta.get("longitude"))
                             sog = body.get("Sog")
-                            if imo and str(imo) not in ("0", "None"):
-                                await upsert_vessel_position(imo, mmsi, lat, lon, sog, ts)
+                            if mmsi and lat is not None and lon is not None:
+                                await upsert_vessel_position(imo_hint, mmsi, lat, lon, sog, ts)
                         elif mtype == "ShipStaticData":
                             body = msg.get("Message", {}).get("ShipStaticData", {}) or {}
                             imo = body.get("ImoNumber")
