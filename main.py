@@ -252,6 +252,18 @@ def today_str() -> str:
 
 
 # ── AIS: vessel upserts + the background AISStream worker ──
+def sanitize_text(s):
+    """AIS ship-name fields occasionally carry malformed/mis-encoded bytes
+    from the source transponder (lone UTF-16 surrogates in particular),
+    which Python's json.loads happily accepts into a str but SQLite's C API
+    then refuses to write. Strip anything that can't round-trip through
+    UTF-8 rather than letting it crash the whole write (and, transitively,
+    every other query sharing the connection)."""
+    if s is None:
+        return None
+    return s.encode("utf-8", "ignore").decode("utf-8").strip() or None
+
+
 async def upsert_vessel_position(imo, mmsi, lat, lon, sog, ts):
     if not imo:
         return
@@ -320,29 +332,33 @@ async def ais_worker():
                         msg = json.loads(raw)
                     except Exception:
                         continue
-                    mtype = msg.get("MessageType")
-                    meta = msg.get("MetaData", {}) or {}
-                    mmsi = meta.get("MMSI")
-                    ts = meta.get("time_utc") or datetime.now(timezone.utc).isoformat()
-                    if mtype == "PositionReport":
-                        body = msg.get("Message", {}).get("PositionReport", {}) or {}
-                        imo = body.get("ImoNumber") or meta.get("IMO")
-                        lat = body.get("Latitude", meta.get("latitude"))
-                        lon = body.get("Longitude", meta.get("longitude"))
-                        sog = body.get("Sog")
-                        if imo and str(imo) not in ("0", "None"):
-                            await upsert_vessel_position(imo, mmsi, lat, lon, sog, ts)
-                    elif mtype == "ShipStaticData":
-                        body = msg.get("Message", {}).get("ShipStaticData", {}) or {}
-                        imo = body.get("ImoNumber")
-                        name = (body.get("Name") or meta.get("ShipName") or "").strip() or None
-                        ais_type = body.get("Type")
-                        dims = body.get("Dimension") or {}
-                        a, b = dims.get("A"), dims.get("B")
-                        loa = (a + b) if (a is not None and b is not None) else None
-                        max_draught = body.get("MaximumStaticDraught")
-                        if imo and str(imo) not in ("0", "None"):
-                            await upsert_vessel_static(imo, mmsi, name, str(ais_type) if ais_type is not None else None, loa, max_draught)
+                    try:
+                        mtype = msg.get("MessageType")
+                        meta = msg.get("MetaData", {}) or {}
+                        mmsi = meta.get("MMSI")
+                        ts = meta.get("time_utc") or datetime.now(timezone.utc).isoformat()
+                        if mtype == "PositionReport":
+                            body = msg.get("Message", {}).get("PositionReport", {}) or {}
+                            imo = body.get("ImoNumber") or meta.get("IMO")
+                            lat = body.get("Latitude", meta.get("latitude"))
+                            lon = body.get("Longitude", meta.get("longitude"))
+                            sog = body.get("Sog")
+                            if imo and str(imo) not in ("0", "None"):
+                                await upsert_vessel_position(imo, mmsi, lat, lon, sog, ts)
+                        elif mtype == "ShipStaticData":
+                            body = msg.get("Message", {}).get("ShipStaticData", {}) or {}
+                            imo = body.get("ImoNumber")
+                            name = sanitize_text(body.get("Name") or meta.get("ShipName"))
+                            ais_type = body.get("Type")
+                            dims = body.get("Dimension") or {}
+                            a, b = dims.get("A"), dims.get("B")
+                            loa = (a + b) if (a is not None and b is not None) else None
+                            max_draught = body.get("MaximumStaticDraught")
+                            if imo and str(imo) not in ("0", "None"):
+                                await upsert_vessel_static(imo, mmsi, name, str(ais_type) if ais_type is not None else None, loa, max_draught)
+                    except Exception as msg_err:
+                        logger.warning("AIS worker: skipping one bad message (%s)", msg_err)
+                        continue
         except Exception as e:
             logger.warning("AIS worker disconnected (%s) — retrying in %ss", e, backoff)
             await asyncio.sleep(backoff)
