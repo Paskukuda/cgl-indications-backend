@@ -504,9 +504,14 @@ async def update_indication(
 
 
 @mcp_server.tool()
-async def add_route(cargo_id: str, label: str, direction: str, low: float, high: float, unit: str = "$/mt") -> dict:
+async def add_route(cargo_id: str, label: str, direction: str, low: float, high: float, unit: str = "$/mt", lot: Optional[str] = None) -> dict:
     """Add a new direction/route under an existing cargo type.
-    direction must be 'outbound' (ex-Ukraine export) or 'backhaul' (import into Ukraine/CVB)."""
+    direction must be 'outbound' (ex-Ukraine export) or 'backhaul' (import into Ukraine/CVB).
+    lot is the parcel-size bracket this rate is for, so the dashboard files it under the right
+    tonnage tab — one of '3000', '5000-6000', '6000-8000', '8000-10000', '20000-25000',
+    '25000-30000' (handysize). ALWAYS pass it when the order/indication states a quantity;
+    a route without a lot shows up under every tonnage tab at once. For a cargo quoted at
+    several sizes, add one route per lot with the same label."""
     state = await load_app_state()
     board = state.setdefault("board", {})
     cargo = board.get("cargoData", {}).get(cargo_id)
@@ -520,7 +525,39 @@ async def add_route(cargo_id: str, label: str, direction: str, low: float, high:
         "low": low, "high": high, "unit": unit,
         "ownersIdeas": [], "charterersIdeas": [], "updatedAt": today_str(),
     }
+    if lot:
+        route["lot"] = lot
     cargo["routes"].append(route)
+    await save_app_state(state, "mcp-agent")
+    return {"ok": True, "route": route}
+
+
+@mcp_server.tool()
+async def update_route(cargo_id: str, route_id: str, label: Optional[str] = None, lot: Optional[str] = None, direction: Optional[str] = None) -> dict:
+    """Change a route's label, tonnage bracket (lot) and/or direction without
+    touching its rate or notes — for fixing a wrong port name (e.g. a load port
+    mislabelled) or filing a route under the right tonnage tab. Only the fields
+    you pass are changed. lot: '3000', '5000-6000', '6000-8000', '8000-10000',
+    '20000-25000', '25000-30000'."""
+    state = await load_app_state()
+    cargo = state.get("board", {}).get("cargoData", {}).get(cargo_id)
+    if not cargo:
+        return {"error": f"cargo_id '{cargo_id}' not found"}
+    route = next((r for r in cargo.get("routes", []) if r.get("id") == route_id), None)
+    if not route:
+        return {"error": f"route_id '{route_id}' not found in {cargo_id}"}
+    if direction is not None and direction not in ("outbound", "backhaul"):
+        return {"error": "direction must be 'outbound' or 'backhaul'"}
+    if label is not None and label.strip():
+        route["label"] = label.strip()
+    if lot is not None:
+        if lot.strip():
+            route["lot"] = lot.strip()
+        else:
+            route.pop("lot", None)
+    if direction is not None:
+        route["direction"] = direction
+    route["updatedAt"] = today_str()
     await save_app_state(state, "mcp-agent")
     return {"ok": True, "route": route}
 
