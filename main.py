@@ -32,6 +32,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import asyncio
 from contextlib import asynccontextmanager
@@ -159,6 +160,15 @@ REFERENCE_PORTS = [
     ("Orlivka", 45.4064, 29.5219),
     ("Giurgiulesti", 45.4589, 28.1897),
     ("Constanta", 44.1733, 28.6383),
+    ("Varna", 43.2000, 27.9500),
+    ("Burgas", 42.4800, 27.4800),
+    ("Sulina", 45.1500, 29.6700),
+    ("Odesa", 46.4900, 30.7500),
+    ("Chornomorsk", 46.3000, 30.6700),
+    ("Pivdennyi", 46.6200, 31.0200),
+    ("Novorossiysk", 44.7200, 37.7800),
+    ("Trabzon", 41.0000, 39.7300),
+    ("Izmir", 38.4400, 27.1400),
     ("Galati", 45.4353, 28.0453),
     ("Braila", 45.2692, 27.9575),
     ("Marmara (Istanbul)", 41.0082, 28.9784),
@@ -1144,19 +1154,33 @@ def is_cargo_type(ais_type):
     return bool(ais_type) and ais_type.strip().startswith("7")
 
 
+def parse_ais_time(s):
+    """AISStream stamps messages Go-style ('2026-09-28 08:40:17.980293281 +0000 UTC',
+    nanoseconds, no ISO 'T'), which datetime.fromisoformat can't read — that's why
+    the fresh/stale flag was always empty. Also accepts plain ISO strings."""
+    if not s:
+        return None
+    s = str(s).strip()
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    m = re.match(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.(\d+))?", s)
+    if not m:
+        return None
+    frac = (m.group(3) or "0")[:6].ljust(6, "0")
+    return datetime.strptime(f"{m.group(1)} {m.group(2)}.{frac}", "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
+
+
 def _vessel_row_to_dict(r):
     lat, lon = r.lat, r.lon
     port_name, port_dist = nearest_port(lat, lon)
     is_stale = None
-    if r.last_seen:
-        try:
-            last_dt = datetime.fromisoformat(r.last_seen.replace("Z", "+00:00"))
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            age_hours = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600.0
-            is_stale = age_hours > STALE_HOURS
-        except Exception:
-            is_stale = None
+    last_dt = parse_ais_time(r.last_seen)
+    if last_dt:
+        age_hours = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600.0
+        is_stale = age_hours > STALE_HOURS
     type_mismatch = bool(r.manual_type and r.ais_type and r.manual_type != r.ais_type)
     is_underway = (r.sog is not None and r.sog > 0.5) if r.sog is not None else None
     return {
@@ -1167,7 +1191,7 @@ def _vessel_row_to_dict(r):
         "destination": r.destination, "eta": r.eta,
         "lat": lat, "lon": lon, "sog": r.sog, "underway": is_underway,
         "nearest_port": port_name, "distance_nm": port_dist,
-        "last_seen": r.last_seen, "stale": is_stale,
+        "last_seen": last_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if last_dt else r.last_seen, "stale": is_stale,
     }
 
 
