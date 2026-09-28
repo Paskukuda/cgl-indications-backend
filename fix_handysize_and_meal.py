@@ -166,7 +166,7 @@ def main():
     if not log:
         print("Nothing to change — everything already in place.")
         return
-    api_call("PUT", "/api/state", token=token, body={"value": state})
+    api_call("PUT", "/api/state", token=token, body={"value": state, "force": True})
     print("\nDone. Changes:")
     for line in log:
         print(" -", line)

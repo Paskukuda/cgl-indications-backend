@@ -113,7 +113,7 @@ def main():
 
     print(f"\nNotes before: {before}, after: {len(new_notes)}")
 
-    api_call("PUT", "/api/state", token=token, body={"value": state})
+    api_call("PUT", "/api/state", token=token, body={"value": state, "force": True})
     print("Saved.")
 
 

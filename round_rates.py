@@ -61,7 +61,7 @@ def main():
         print("Nothing to round \u2014 all rates already whole numbers.")
         return
 
-    api_call("PUT", "/api/state", token=token, body={"value": state})
+    api_call("PUT", "/api/state", token=token, body={"value": state, "force": True})
     print(f"Done. Rounded {changed} route(s) to whole-number rates.")
 
 

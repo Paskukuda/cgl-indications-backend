@@ -168,7 +168,7 @@ def main():
         print("Nothing to change - looks like this has already been applied.")
         return
 
-    api_call("PUT", "/api/state", token=token, body={"value": state})
+    api_call("PUT", "/api/state", token=token, body={"value": state, "force": True})
     print("\nDone. Changes applied:")
     for c in changes:
         print(" -", c)

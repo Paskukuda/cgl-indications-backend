@@ -35,6 +35,7 @@ import os
 import re
 import secrets
 import asyncio
+import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
@@ -138,6 +139,15 @@ SCHEMA_STATEMENTS = [
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_vessels_mmsi ON vessels (mmsi)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS state_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT,
+        size INTEGER,
+        value BLOB NOT NULL
+    )
     """,
 ]
 
@@ -245,6 +255,9 @@ async def load_app_state() -> dict:
         return json.loads(row.value) if row else {}
 
 
+HISTORY_KEEP = 200
+
+
 async def save_app_state(state: dict, actor: str) -> str:
     now = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(state)
@@ -258,6 +271,15 @@ async def save_app_state(state: dict, actor: str) -> str:
                 """
             ),
             {"v": payload, "t": now, "u": actor},
+        )
+        # Keep the last HISTORY_KEEP saves (compressed) so an overwrite can be traced and undone.
+        await db.execute(
+            text("INSERT INTO state_history (updated_at, updated_by, size, value) VALUES (:t, :u, :s, :z)"),
+            {"t": now, "u": actor, "s": len(payload), "z": zlib.compress(payload.encode("utf-8"), 6)},
+        )
+        await db.execute(
+            text("DELETE FROM state_history WHERE id <= (SELECT MAX(id) FROM state_history) - :keep"),
+            {"keep": HISTORY_KEEP},
         )
         await db.commit()
     return now
@@ -726,9 +748,20 @@ async def update_document_tool(
 
 
 @mcp_server.tool()
-async def find_vessels_near(lat: float, lon: float, radius_nm: float = 30, cargo_only: bool = True) -> dict:
+async def find_vessels_near(lat: Optional[float] = None, lon: Optional[float] = None, radius_nm: float = 30,
+                            cargo_only: bool = True, port: Optional[str] = None,
+                            dwt_min: Optional[float] = None, dwt_max: Optional[float] = None,
+                            loa_min: Optional[float] = None, loa_max: Optional[float] = None,
+                            limit: int = 25) -> dict:
     """Find open vessels from the live AIS feed within radius_nm nautical
-    miles of a point (e.g. a load port). cargo_only=True (default) filters
+    miles of a point (lat/lon) OR of a named port: port="Varna", "Constanta",
+    "Burgas", "Izmail"... or port="CVB" for Constanta+Varna+Burgas together
+    (the handysize load region; use "CVB" for those orders). Size filters —
+    dwt_min/dwt_max (e.g. 20000/40000 for handysize) judge vessels by DWT;
+    add loa_min/loa_max (hull length in metres, e.g. 160/190) to ALSO include
+    vessels whose DWT is not known yet, judged by hull length (each result
+    says which one matched in "size_match"). DWT values marked
+    dwt_source="name-match" are approximate. cargo_only=True (default) filters
     to AIS type codes 70-79 (cargo/bulk-type traffic) so yachts, passenger
     and other irrelevant vessel types the feed also picks up are excluded
     — set False to see everything. Returns each vessel's IMO, MMSI, name,
@@ -748,8 +781,19 @@ async def find_vessels_near(lat: float, lon: float, radius_nm: float = 30, cargo
     open/available — always say so when relaying results, and prefer
     cross-checking a candidate against a broker circular (mail) or a
     direct check before treating it as a real candidate."""
-    vessels = await query_vessels_near(lat, lon, radius_nm, cargo_only=cargo_only)
-    return {"vessels": vessels, "disclaimer": AIS_DISCLAIMER}
+    centers = None
+    if port:
+        centers, _ = resolve_port_centers(port)
+        if centers is None:
+            return {"error": f"unknown port '{port}'", "known_ports": known_port_names()}
+    elif lat is not None and lon is not None:
+        centers = [(lat, lon)]
+    else:
+        return {"error": "give either port=<name> (or 'CVB') or lat+lon"}
+    async with SessionLocal() as db:
+        rows = (await db.execute(text("SELECT * FROM vessels WHERE lat IS NOT NULL AND lon IS NOT NULL"))).all()
+    found = select_vessels(rows, centers, radius_nm, cargo_only, dwt_min, dwt_max, loa_min, loa_max)
+    return {"vessels": found[:limit], "total_matching": len(found), "disclaimer": AIS_DISCLAIMER}
 
 
 @mcp_server.tool()
@@ -811,6 +855,20 @@ async def set_vessel_dwt(imo: str, dwt: float, source: Optional[str] = None) -> 
         if result.rowcount == 0:
             return {"error": f"no AIS data for IMO {imo} yet — it must appear in the AIS feed at least once before you can annotate it"}
     return {"ok": True}
+
+
+@mcp_server.tool()
+async def get_state_history(limit: int = 15) -> dict:
+    """Recent saves of the dashboard's board/notes data — when, by whom (a dashboard user's
+    browser, 'mcp-agent' for chat tools, or a script run under a user's login) and how big.
+    Read-only; use it to find out what overwrote a change. A version can be restored on the
+    server with restore_state_version.py."""
+    async with SessionLocal() as db:
+        rows = (await db.execute(
+            text("SELECT id, updated_at, updated_by, size FROM state_history ORDER BY id DESC LIMIT :n"),
+            {"n": max(1, min(int(limit), 100))},
+        )).all()
+    return {"saves": [{"id": r.id, "updated_at": r.updated_at, "updated_by": r.updated_by, "bytes": r.size} for r in rows]}
 
 
 mcp_asgi_app = mcp_server.streamable_http_app()
@@ -927,6 +985,12 @@ class LoginBody(BaseModel):
 
 class StateBody(BaseModel):
     value: dict
+    # The updated_at the client last loaded/saved. If it no longer matches the server's,
+    # somebody else (the indications chat, a script, another tab) changed the data since —
+    # the save is refused with 409 instead of silently overwriting their work.
+    base_updated_at: Optional[str] = None
+    # One-off maintenance scripts read the fresh state right before writing and may skip the check.
+    force: bool = False
 
 
 @app.get("/api/health")
@@ -1021,6 +1085,16 @@ async def get_state(username: str = Depends(get_current_username)):
 
 @app.put("/api/state")
 async def put_state(body: StateBody, username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        row = (await db.execute(text("SELECT updated_at FROM kv_store WHERE key='app_state'"))).first()
+    current = row.updated_at if row else None
+    if current is not None and not body.force:
+        if body.base_updated_at is None:
+            # An old copy of the page (open since before this check existed) would otherwise
+            # silently overwrite everything the chat/scripts changed since it loaded.
+            raise HTTPException(status_code=428, detail="This page is an old version and can't save safely — reload it (Ctrl+Shift+R). Nothing was overwritten.")
+        if current != body.base_updated_at:
+            raise HTTPException(status_code=409, detail="The data was changed elsewhere since this page loaded — reload to get the latest version")
     now = await save_app_state(body.value, username)
     return {"ok": True, "updated_at": now, "updated_by": username}
 
@@ -1202,29 +1276,98 @@ def _vessel_row_to_dict(r):
     }
 
 
-async def query_vessels_near(lat, lon, radius_nm, limit=25, cargo_only=True):
-    async with SessionLocal() as db:
-        rows = (await db.execute(text("SELECT * FROM vessels WHERE lat IS NOT NULL AND lon IS NOT NULL"))).all()
+def resolve_port_centers(port):
+    """'CVB' = Constanta + Varna + Burgas (the handysize load region); otherwise any
+    reference port whose name contains the text. Returns (centers, matched_names) or (None, None)."""
+    p = (port or "").strip().lower()
+    if not p:
+        return None, None
+    wanted = {"constanta", "varna", "burgas"} if p == "cvb" else None
+    matched = [(n, la, lo) for n, la, lo in REFERENCE_PORTS
+               if (n.lower() in wanted if wanted else p in n.lower())]
+    if not matched:
+        return None, None
+    return [(la, lo) for _, la, lo in matched], [n for n, _, _ in matched]
+
+
+def known_port_names():
+    return ["CVB"] + [n for n, _, _ in REFERENCE_PORTS]
+
+
+def _in_range(x, lo, hi):
+    return x is not None and (lo is None or x >= lo) and (hi is None or x <= hi)
+
+
+def select_vessels(rows, centers=None, radius_nm=30, cargo_only=True,
+                   dwt_min=None, dwt_max=None, loa_min=None, loa_max=None):
+    """Shared filter for the dashboard AIS tab and the chat tool.
+    Size rule: with a DWT range set, a vessel passes on its DWT; if a hull-length range is
+    ALSO set, vessels whose DWT is unknown can pass on hull length instead (that is what
+    the length range is for). With only a length range, everything is judged by length."""
+    dwt_active = dwt_min is not None or dwt_max is not None
+    loa_active = loa_min is not None or loa_max is not None
     out = []
     for r in rows:
         if cargo_only and not is_cargo_type(r.ais_type):
             continue
-        d = haversine_nm(lat, lon, r.lat, r.lon)
-        if d <= radius_nm:
-            v = _vessel_row_to_dict(r)
-            v["distance_from_query_nm"] = round(d, 1)
-            out.append(v)
-    out.sort(key=lambda v: v["distance_from_query_nm"])
-    return out[:limit]
+        dist = None
+        if centers:
+            if r.lat is None or r.lon is None:
+                continue
+            dist = min(haversine_nm(la, lo, r.lat, r.lon) for la, lo in centers)
+            if dist > radius_nm:
+                continue
+        loa = r.loa if (r.loa and r.loa > 0) else None
+        size_match = None
+        if dwt_active and loa_active:
+            if _in_range(r.manual_dwt, dwt_min, dwt_max):
+                size_match = "dwt"
+            elif r.manual_dwt is None and _in_range(loa, loa_min, loa_max):
+                size_match = "hull length (DWT unknown)"
+            else:
+                continue
+        elif dwt_active:
+            if not _in_range(r.manual_dwt, dwt_min, dwt_max):
+                continue
+            size_match = "dwt"
+        elif loa_active:
+            if not _in_range(loa, loa_min, loa_max):
+                continue
+            size_match = "hull length"
+        v = _vessel_row_to_dict(r)
+        if dist is not None:
+            v["distance_from_query_nm"] = round(dist, 1)
+        if size_match:
+            v["size_match"] = size_match
+        out.append(v)
+    if centers:
+        out.sort(key=lambda v: v["distance_from_query_nm"])
+    return out
+
+
+async def query_vessels_near(lat, lon, radius_nm, limit=25, cargo_only=True):
+    async with SessionLocal() as db:
+        rows = (await db.execute(text("SELECT * FROM vessels WHERE lat IS NOT NULL AND lon IS NOT NULL"))).all()
+    return select_vessels(rows, [(lat, lon)], radius_nm, cargo_only)[:limit]
 
 
 @app.get("/api/vessels")
-async def list_vessels(all_types: bool = False, username: str = Depends(get_current_username)):
+async def list_vessels(all_types: bool = False, port: Optional[str] = None, radius_nm: float = 30,
+                       dwt_min: Optional[float] = None, dwt_max: Optional[float] = None,
+                       loa_min: Optional[float] = None, loa_max: Optional[float] = None,
+                       limit: Optional[int] = None, username: str = Depends(get_current_username)):
+    centers = None
+    if port:
+        centers, _ = resolve_port_centers(port)
+        if centers is None:
+            raise HTTPException(status_code=400, detail=f"Unknown port '{port}'")
     async with SessionLocal() as db:
         rows = (await db.execute(text("SELECT * FROM vessels ORDER BY updated_at DESC"))).all()
-    if not all_types:
-        rows = [r for r in rows if is_cargo_type(r.ais_type)]
-    return {"vessels": [_vessel_row_to_dict(r) for r in rows], "disclaimer": AIS_DISCLAIMER}
+    vessels = select_vessels(rows, centers, radius_nm, not all_types, dwt_min, dwt_max, loa_min, loa_max)
+    total = len(vessels)
+    if limit:
+        vessels = vessels[:limit]
+    return {"vessels": vessels, "total_matching": total, "ports": known_port_names(), "disclaimer": AIS_DISCLAIMER}
 
 
 class VesselAnnotateBody(BaseModel):
