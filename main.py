@@ -124,6 +124,7 @@ SCHEMA_STATEMENTS = [
         manual_type TEXT,
         dwt REAL,
         manual_dwt REAL,
+        dwt_source TEXT,
         loa REAL,
         max_draught REAL,
         destination TEXT,
@@ -220,6 +221,7 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE vessels ADD COLUMN max_draught REAL",
     "ALTER TABLE vessels ADD COLUMN destination TEXT",
     "ALTER TABLE vessels ADD COLUMN eta TEXT",
+    "ALTER TABLE vessels ADD COLUMN dwt_source TEXT",
 ]
 
 
@@ -794,15 +796,17 @@ async def set_vessel_manual_type_tool(imo: str, manual_type: str) -> dict:
 
 
 @mcp_server.tool()
-async def set_vessel_dwt(imo: str, dwt: float) -> dict:
+async def set_vessel_dwt(imo: str, dwt: float, source: Optional[str] = None) -> dict:
     """Record a vessel's deadweight tonnage (DWT) by IMO. Raw AIS never
     carries DWT — it's registry data — so use this after looking the
     vessel up on a free public source (e.g. Equasis, MagicPort) or from
     the broker's own vessel database, and it'll show on the dashboard's
     AIS/Vessels tab from then on. The vessel must already have appeared in
-    the AIS feed at least once (i.e. have a row) before you can annotate it."""
+    the AIS feed at least once (i.e. have a row) before you can annotate it.
+    source (optional): where the figure came from — "manual" (default), "crm-imo", or
+    "name-match" if it was only matched by vessel name (shown as approximate on the dashboard)."""
     async with SessionLocal() as db:
-        result = await db.execute(text("UPDATE vessels SET manual_dwt=:d WHERE imo=:imo"), {"d": dwt, "imo": str(imo)})
+        result = await db.execute(text("UPDATE vessels SET manual_dwt=:d, dwt_source=:s WHERE imo=:imo"), {"d": dwt, "s": source or "manual", "imo": str(imo)})
         await db.commit()
         if result.rowcount == 0:
             return {"error": f"no AIS data for IMO {imo} yet — it must appear in the AIS feed at least once before you can annotate it"}
@@ -1187,6 +1191,9 @@ def _vessel_row_to_dict(r):
         "imo": r.imo, "mmsi": r.mmsi, "name": r.name,
         "ais_type": r.ais_type, "manual_type": r.manual_type, "type_mismatch": type_mismatch,
         "dwt": r.manual_dwt,  # only ever set manually/imported — AIS itself carries no DWT field
+        # None/"manual"/"crm-imo" = trusted (typed in or matched by IMO); "name-match" = matched by
+        # vessel NAME against a broker list — plausible, but not confirmed by IMO
+        "dwt_source": r.dwt_source,
         "loa": r.loa, "max_draught": r.max_draught,
         "destination": r.destination, "eta": r.eta,
         "lat": lat, "lon": lon, "sog": r.sog, "underway": is_underway,
@@ -1223,19 +1230,22 @@ async def list_vessels(all_types: bool = False, username: str = Depends(get_curr
 class VesselAnnotateBody(BaseModel):
     manual_type: Optional[str] = None
     manual_dwt: Optional[float] = None
+    dwt_source: Optional[str] = None
 
 
 @app.put("/api/vessels/{imo}/type")
 async def set_vessel_manual_type(imo: str, body: VesselAnnotateBody, username: str = Depends(get_current_username)):
     async with SessionLocal() as db:
-        row = (await db.execute(text("SELECT imo, manual_type, manual_dwt FROM vessels WHERE imo=:imo"), {"imo": imo})).first()
+        row = (await db.execute(text("SELECT imo, manual_type, manual_dwt, dwt_source FROM vessels WHERE imo=:imo"), {"imo": imo})).first()
         if not row:
             raise HTTPException(status_code=404, detail="Vessel not found")
         new_type = body.manual_type if body.manual_type is not None else row.manual_type
         new_dwt = body.manual_dwt if body.manual_dwt is not None else row.manual_dwt
+        # typing a DWT in by hand (no source given) makes it a trusted value again
+        new_src = (body.dwt_source or "manual") if body.manual_dwt is not None else row.dwt_source
         await db.execute(
-            text("UPDATE vessels SET manual_type=:t, manual_dwt=:d WHERE imo=:imo"),
-            {"t": new_type, "d": new_dwt, "imo": imo},
+            text("UPDATE vessels SET manual_type=:t, manual_dwt=:d, dwt_source=:s WHERE imo=:imo"),
+            {"t": new_type, "d": new_dwt, "s": new_src, "imo": imo},
         )
         await db.commit()
     return {"ok": True}

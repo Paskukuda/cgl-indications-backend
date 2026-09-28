@@ -71,7 +71,7 @@ def main():
         if not ref:
             not_in_reference += 1
             continue
-        api_call("PUT", f"/api/vessels/{imo}/type", token=token, body={"manual_dwt": ref["dwt"]})
+        api_call("PUT", f"/api/vessels/{imo}/type", token=token, body={"manual_dwt": ref["dwt"], "dwt_source": "crm-imo"})
         print(f"  {v.get('name') or ref['name']:25} IMO={imo}  DWT={ref['dwt']}")
         updated += 1
 
