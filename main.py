@@ -922,6 +922,14 @@ async def health():
 
 @app.post("/api/login")
 async def login(body: LoginBody):
+    # A password typed with the wrong keyboard layout can arrive as lone
+    # surrogate characters that can't be encoded to UTF-8 — that used to blow
+    # up inside the database driver as a 500. It's just a wrong password.
+    try:
+        body.username.encode("utf-8")
+        body.password.encode("utf-8")
+    except UnicodeEncodeError:
+        raise HTTPException(status_code=401, detail="Invalid username or password (check the keyboard layout)")
     async with SessionLocal() as db:
         row = (
             await db.execute(
