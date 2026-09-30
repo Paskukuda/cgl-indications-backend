@@ -5,3 +5,5 @@ aiosqlite
 mcp<2
 websockets
 python-dotenv
+xlrd
+openpyxl

@@ -141,6 +141,33 @@ SCHEMA_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS idx_vessels_mmsi ON vessels (mmsi)
     """,
     """
+    CREATE TABLE IF NOT EXISTS lion_regions (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        sort_order INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS lion_positions (
+        id TEXT PRIMARY KEY,
+        vessel_name TEXT NOT NULL,
+        name_key TEXT NOT NULL,
+        built INTEGER,
+        dwt REAL,
+        position TEXT,
+        open_from TEXT,
+        open_to TEXT,
+        comments TEXT,
+        region TEXT,
+        region_manual INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_lion_positions_name ON lion_positions (name_key)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS state_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         updated_at TEXT NOT NULL,
@@ -960,6 +987,13 @@ async def lifespan(app: FastAPI):
                     await conn.execute(text(stmt))
                 except Exception:
                     pass  # column already exists (older DB already migrated)
+            existing = (await conn.execute(text("SELECT COUNT(*) FROM lion_regions"))).scalar()
+            if not existing:
+                await conn.execute(
+                    text("INSERT INTO lion_regions (id, label, sort_order) VALUES (:id, :label, :o)"),
+                    [{"id": "bsea_med", "label": "BSEA - MED", "o": 0},
+                     {"id": "cont_balt", "label": "CONT - BALT", "o": 1}],
+                )
         ais_task = asyncio.create_task(ais_worker())
         try:
             yield
@@ -1395,4 +1429,333 @@ async def set_vessel_manual_type(imo: str, body: VesselAnnotateBody, username: s
             {"t": new_type, "d": new_dwt, "s": new_src, "imo": imo},
         )
         await db.commit()
+    return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════
+# Lion SP — Lion Maritime's own open-positions list (uploaded as an
+# .xls/.xlsx export, no IMO in the source data, matched by vessel name)
+# ══════════════════════════════════════════════════════════
+LION_STALE_DAYS = 21
+
+# Keyword -> region id, checked against the "Position"/"Open Area" text
+# (case-insensitive substring match, longest-keyword-first so e.g.
+# "north adriatic" doesn't get shadowed by a shorter unrelated match).
+LION_REGION_KEYWORDS = {
+    "bsea_med": [
+        "black sea", "azov", "mediterranean", "med sea", "adriatic", "aegean", "marmara",
+        "danube", "bosphorus", "dardanelles", "bizerte", "sfax", "gabes", "tunis", "tripoli",
+        "libya", "algeria", "algiers", "annaba", "oran", "djen djen", "bejaia", "nador",
+        "egypt", "alexandria", "damietta", "port said", "israel", "ashdod", "haifa",
+        "lebanon", "beirut", "syria", "latakia", "tartus", "cyprus", "famagusta", "limassol",
+        "turkey", "mersin", "iskenderun", "samsun", "trabzon", "tuzla", "ambarli", "aliaga",
+        "bandirma", "nemrut", "izmir", "canakkale", "dilis kelesi", "diliskelesi",
+        "greece", "piraeus", "chalkis", "ravenna", "vatika", "spain", "spanish med", "sagunto",
+        "tarragona", "castellon", "valencia", "fos", "italy", "italian", "porto marghera",
+        "otranto", "livorno", "piombino", "naples", "catania", "monopoli", "varna", "burgas",
+        "constanta", "istanbul", "izmail", "reni", "odesa", "odessa", "poti", "georgia",
+    ],
+    "cont_balt": [
+        "baltic", "north sea", "continent", "rotterdam", "amsterdam", "antwerp", "hamburg",
+        "bremen", "gdansk", "gdynia", "klaipeda", "riga", "tallinn", "st petersburg",
+        "ust-luga", "ust luga", "uk", "united kingdom", "france", "le havre", "dunkirk",
+        "skaw", "denmark", "poland", "germany",
+    ],
+}
+
+
+def classify_lion_region(position_text):
+    if not position_text:
+        return None
+    p = position_text.lower()
+    best_region, best_len = None, 0
+    for region_id, keywords in LION_REGION_KEYWORDS.items():
+        for kw in keywords:
+            if kw in p and len(kw) > best_len:
+                best_region, best_len = region_id, len(kw)
+    return best_region
+
+
+def lion_name_key(name):
+    return re.sub(r"[^A-Z0-9]+", "", str(name or "").upper())
+
+
+_DATE_RANGE_RE = re.compile(
+    r"(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*-\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})"
+)
+_DATE_SINGLE_RE = re.compile(r"(\d{1,2}[./]\d{1,2}[./]\d{2,4})")
+
+
+def _parse_one_date(s):
+    s = s.replace("/", ".")
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_lion_date_range(raw):
+    """'05.10.2026 - 07.10.2026' -> (from, to); a single date -> (d, d);
+    anything unrecognised -> (None, None) (the row is still imported,
+    just without dates to sort/expire by)."""
+    if not raw:
+        return None, None
+    raw = str(raw).strip()
+    m = _DATE_RANGE_RE.search(raw)
+    if m:
+        return _parse_one_date(m.group(1)), _parse_one_date(m.group(2))
+    m = _DATE_SINGLE_RE.search(raw)
+    if m:
+        d = _parse_one_date(m.group(1))
+        return d, d
+    return None, None
+
+
+def parse_lion_dwt(raw):
+    if raw is None or raw == "":
+        return None
+    s = re.sub(r"[^\d.]", "", str(raw).replace("\xa0", "").replace(",", ""))
+    try:
+        return float(s) if s else None
+    except ValueError:
+        return None
+
+
+def parse_lion_built(raw):
+    try:
+        y = int(float(raw))
+        return y if 1960 <= y <= 2035 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_lion_workbook(raw_bytes, filename):
+    """Reads the 'No, Vessel Name, DWT, BLT, Open Area, Open Date' export
+    (column order detected by header name, not position, so a reordered or
+    lightly-different export still works) from .xls or .xlsx. Returns a
+    list of raw row dicts; header/column matching is case-insensitive and
+    tolerant of the exact wording (e.g. 'Vessel Name' or 'VESSEL')."""
+    import io
+
+    def col_index(headers, *candidates):
+        low = [str(h or "").strip().lower() for h in headers]
+        for cand in candidates:
+            for i, h in enumerate(low):
+                if cand in h:
+                    return i
+        return None
+
+    rows_out = []
+    lower_name = (filename or "").lower()
+    if lower_name.endswith(".xlsx"):
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=True)
+        ws = wb.worksheets[0]
+        raw_rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    else:
+        import xlrd
+        wb = xlrd.open_workbook(file_contents=raw_bytes)
+        ws = wb.sheet_by_index(0)
+        raw_rows = [[ws.cell_value(r, c) for c in range(ws.ncols)] for r in range(ws.nrows)]
+
+    if not raw_rows:
+        return []
+    headers = raw_rows[0]
+    i_name = col_index(headers, "vessel")
+    i_dwt = col_index(headers, "dwt")
+    i_built = col_index(headers, "blt", "built")
+    i_area = col_index(headers, "open area", "position", "area")
+    i_date = col_index(headers, "open date", "open from", "date")
+    i_comments = col_index(headers, "comment")
+    if i_name is None:
+        raise ValueError("Couldn't find a vessel-name column in this file's header row")
+
+    def cell(row, idx):
+        if idx is None or idx >= len(row):
+            return None
+        v = row[idx]
+        return None if v == "" else v
+
+    for r in raw_rows[1:]:
+        name = cell(r, i_name)
+        if not name or not str(name).strip():
+            continue
+        rows_out.append({
+            "vessel_name": str(name).strip(),
+            "dwt": parse_lion_dwt(cell(r, i_dwt)),
+            "built": parse_lion_built(cell(r, i_built)),
+            "position": str(cell(r, i_area) or "").strip() or None,
+            "open_raw": cell(r, i_date),
+            "comments": str(cell(r, i_comments) or "").strip() or None,
+        })
+    return rows_out
+
+
+async def lion_purge_stale(db):
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=LION_STALE_DAYS)).isoformat()
+    result = await db.execute(
+        text(
+            "DELETE FROM lion_positions WHERE COALESCE(open_to, open_from) IS NOT NULL "
+            "AND COALESCE(open_to, open_from) < :cutoff"
+        ),
+        {"cutoff": cutoff},
+    )
+    return result.rowcount or 0
+
+
+@app.get("/api/lion-positions")
+async def list_lion_positions(username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        regions = (await db.execute(text("SELECT id, label, sort_order FROM lion_regions ORDER BY sort_order"))).all()
+        rows = (await db.execute(text("SELECT * FROM lion_positions ORDER BY dwt"))).all()
+    return {
+        "regions": [{"id": r.id, "label": r.label} for r in regions],
+        "positions": [
+            {
+                "id": r.id, "vessel_name": r.vessel_name, "built": r.built, "dwt": r.dwt,
+                "position": r.position, "open_from": r.open_from, "open_to": r.open_to,
+                "comments": r.comments, "region": r.region, "region_manual": bool(r.region_manual),
+                "updated_at": r.updated_at,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/api/lion-positions/upload")
+async def upload_lion_positions(body: dict, username: str = Depends(get_current_username)):
+    """body: {filename, content_base64}. Parses the workbook, collapses
+    same-named duplicates within the upload (row order = recency in this
+    export — the first/topmost row for a given vessel is its newest
+    listing, later duplicates are older re-listings and are dropped),
+    upserts each vessel by name (an update replaces that vessel's position
+    entirely — the new circular supersedes the old one), auto-classifies
+    the region from the position text unless the row was manually
+    reassigned, then purges anything now more than 21 days past its open
+    date across the whole table (not just this upload)."""
+    import base64
+
+    filename = body.get("filename") or ""
+    b64 = body.get("content_base64")
+    if not b64:
+        raise HTTPException(status_code=400, detail="No file content received")
+    try:
+        raw_bytes = base64.b64decode(b64)
+        parsed = parse_lion_workbook(raw_bytes, filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Couldn't read this file: {e}")
+    if not parsed:
+        raise HTTPException(status_code=400, detail="No vessel rows found in this file")
+
+    by_key = {}
+    for row in parsed:
+        key = lion_name_key(row["vessel_name"])
+        if not key:
+            continue
+        open_from, open_to = parse_lion_date_range(row["open_raw"])
+        row["open_from"], row["open_to"] = open_from, open_to
+        if key not in by_key:
+            by_key[key] = row  # row order = recency (row 1 is the newest email); first occurrence wins, later duplicates are older re-listings
+
+    now = datetime.now(timezone.utc).isoformat()
+    added, updated = 0, 0
+    async with SessionLocal() as db:
+        for key, row in by_key.items():
+            existing = (await db.execute(
+                text("SELECT id, region, region_manual FROM lion_positions WHERE name_key=:k"), {"k": key}
+            )).first()
+            region = existing.region if (existing and existing.region_manual) else classify_lion_region(row["position"])
+            if existing:
+                await db.execute(
+                    text(
+                        "UPDATE lion_positions SET vessel_name=:name, built=:built, dwt=:dwt, position=:pos, "
+                        "open_from=:of, open_to=:ot, comments=:c, region=:r, updated_at=:now WHERE id=:id"
+                    ),
+                    {"name": row["vessel_name"], "built": row["built"], "dwt": row["dwt"], "pos": row["position"],
+                     "of": row["open_from"], "ot": row["open_to"], "c": row["comments"], "r": region,
+                     "now": now, "id": existing.id},
+                )
+                updated += 1
+            else:
+                await db.execute(
+                    text(
+                        "INSERT INTO lion_positions (id, vessel_name, name_key, built, dwt, position, open_from, "
+                        "open_to, comments, region, region_manual, updated_at, created_at) VALUES "
+                        "(:id, :name, :key, :built, :dwt, :pos, :of, :ot, :c, :r, 0, :now, :now)"
+                    ),
+                    {"id": secrets.token_hex(12), "name": row["vessel_name"], "key": key, "built": row["built"],
+                     "dwt": row["dwt"], "pos": row["position"], "of": row["open_from"], "ot": row["open_to"],
+                     "c": row["comments"], "r": region, "now": now},
+                )
+                added += 1
+        removed = await lion_purge_stale(db)
+        await db.commit()
+    return {"ok": True, "rows_in_file": len(parsed), "added": added, "updated": updated, "removed_stale": removed}
+
+
+class LionRowBody(BaseModel):
+    vessel_name: Optional[str] = None
+    built: Optional[int] = None
+    dwt: Optional[float] = None
+    position: Optional[str] = None
+    open_from: Optional[str] = None
+    open_to: Optional[str] = None
+    comments: Optional[str] = None
+    region: Optional[str] = None
+
+
+class LionRegionsBody(BaseModel):
+    regions: list
+
+
+@app.put("/api/lion-positions/regions")
+async def set_lion_regions(body: LionRegionsBody, username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        existing_ids = {r.id for r in (await db.execute(text("SELECT id FROM lion_regions"))).all()}
+        new_ids = {r["id"] for r in body.regions}
+        for rid in existing_ids - new_ids:
+            await db.execute(text("UPDATE lion_positions SET region=NULL WHERE region=:r"), {"r": rid})
+            await db.execute(text("DELETE FROM lion_regions WHERE id=:id"), {"id": rid})
+        await db.execute(text("DELETE FROM lion_regions"))
+        await db.execute(
+            text("INSERT INTO lion_regions (id, label, sort_order) VALUES (:id, :label, :o)"),
+            [{"id": r["id"], "label": r["label"], "o": i} for i, r in enumerate(body.regions)],
+        )
+        await db.commit()
+    return {"ok": True}
+
+
+@app.put("/api/lion-positions/{row_id}")
+async def update_lion_position(row_id: str, body: LionRowBody, username: str = Depends(get_current_username)):
+    fields = body.dict(exclude_unset=True)
+    if not fields:
+        return {"ok": True}
+    now = datetime.now(timezone.utc).isoformat()
+    sets, params = [], {"id": row_id, "now": now}
+    for k, v in fields.items():
+        sets.append(f"{k}=:{k}")
+        params[k] = v
+    if "region" in fields:
+        sets.append("region_manual=1")
+    if "vessel_name" in fields:
+        params["name_key"] = lion_name_key(fields["vessel_name"])
+        sets.append("name_key=:name_key")
+    sets.append("updated_at=:now")
+    async with SessionLocal() as db:
+        result = await db.execute(text(f"UPDATE lion_positions SET {', '.join(sets)} WHERE id=:id"), params)
+        await db.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Row not found")
+    return {"ok": True}
+
+
+@app.delete("/api/lion-positions/{row_id}")
+async def delete_lion_position(row_id: str, username: str = Depends(get_current_username)):
+    async with SessionLocal() as db:
+        result = await db.execute(text("DELETE FROM lion_positions WHERE id=:id"), {"id": row_id})
+        await db.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Row not found")
     return {"ok": True}
