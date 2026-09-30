@@ -157,9 +157,10 @@ SCHEMA_STATEMENTS = [
 # rectangles rather than one huge box so the subscription stays reasonably
 # tight (fewer irrelevant vessels streamed).
 AIS_BOUNDING_BOXES = [
-    [[40.0, 27.0], [47.5, 42.0]],   # Black Sea + Azov + Danube mouth
-    [[30.0, -6.0], [46.0, 27.0]],   # Mediterranean
-    [[12.0, 32.0], [30.0, 43.5]],   # Red Sea
+    [[40.0, 27.0], [47.5, 42.0]],   # Box 1: Black Sea + Azov + Marmara + straits (Danube, Ukraine, Romania, Bulgaria, N.Turkey)
+    [[31.0, 14.0], [41.0, 36.5]],   # Box 2: Central + Eastern Mediterranean (Malta east through the Levant, up to the Suez approach)
+    # Deliberately NOT one box spanning both seas (wastes traffic over the Balkans/Turkey land mass in between),
+    # and deliberately NOT extending south of 31.0N (that's the Suez Canal / Red Sea — out of scope for now).
 ]
 
 # Reference ports used for "nearest port" / distance-to-port on the AIS tab —
@@ -193,6 +194,9 @@ REFERENCE_PORTS = [
     ("Famagusta", 35.1167, 33.9500),
     ("Beirut", 33.9000, 35.5167),
     ("Tartus", 34.8833, 35.8833),
+    ("Latakia", 35.5167, 35.7833),
+    ("Limassol", 34.6753, 33.0453),
+    ("Port Said", 31.2653, 32.3019),
     ("Alexandria", 31.2001, 29.9187),
     ("El Arish", 31.1300, 33.8000),
     ("Egypt Med (Damietta)", 31.4167, 31.8167),
