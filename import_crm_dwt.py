@@ -3,8 +3,8 @@
 One-off (but safe-to-re-run) bulk import: fills in manual_dwt for any
 vessel that already has a row in the dashboard's `vessels` table (i.e. the
 AIS worker has seen it at least once), using the broker's own CRM vessel
-export (crm_vessel_dwt_reference.json, built from
-srm_vessels_0_-_11000_dwt.txt — 8,865 vessels, IMO -> {name, dwt}).
+export (crm_vessel_dwt_reference.json, merged from the broker's 0-11,000
+and 11,000-40,000 DWT exports — 14,011 vessels, IMO -> {name, dwt}).
 
 Deliberately does NOT create new vessel rows for IMOs the AIS feed hasn't
 seen yet — that would fill the table with thousands of position-less
