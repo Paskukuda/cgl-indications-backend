@@ -168,6 +168,44 @@ SCHEMA_STATEMENTS = [
     CREATE UNIQUE INDEX IF NOT EXISTS idx_lion_positions_name ON lion_positions (name_key)
     """,
     """
+    CREATE TABLE IF NOT EXISTS wa_vessels (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        name TEXT,
+        imo TEXT,
+        mmsi TEXT,
+        build_year INTEGER,
+        flag TEXT,
+        dwt REAL,
+        dwcc REAL,
+        intake_mt REAL,
+        grain_cbft REAL,
+        bale_cbft REAL,
+        draft_m REAL,
+        holds TEXT,
+        gear TEXT,
+        position TEXT,
+        region TEXT,
+        open_from TEXT,
+        open_to TEXT,
+        restrictions TEXT,
+        freight_idea TEXT,
+        contact TEXT,
+        broker_company TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        source_chat TEXT,
+        source_sender TEXT,
+        source_date TEXT,
+        raw_text TEXT,
+        note TEXT,
+        match_key TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_wa_vessels_match_key ON wa_vessels (match_key)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS state_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         updated_at TEXT NOT NULL,
@@ -900,6 +938,138 @@ async def get_state_history(limit: int = 15) -> dict:
             {"n": max(1, min(int(limit), 100))},
         )).all()
     return {"saves": [{"id": r.id, "updated_at": r.updated_at, "updated_by": r.updated_by, "bytes": r.size} for r in rows]}
+
+
+@mcp_server.tool()
+async def add_wa_vessel(
+    name: Optional[str] = None, imo: Optional[str] = None, mmsi: Optional[str] = None,
+    build_year: Optional[int] = None, flag: Optional[str] = None, dwt: Optional[float] = None,
+    dwcc: Optional[float] = None, intake_mt: Optional[float] = None, grain_cbft: Optional[float] = None,
+    bale_cbft: Optional[float] = None, draft_m: Optional[float] = None, holds: Optional[str] = None,
+    gear: Optional[str] = None, position: Optional[str] = None, region: Optional[str] = None,
+    open_from: Optional[str] = None, open_to: Optional[str] = None, restrictions: Optional[str] = None,
+    freight_idea: Optional[str] = None, contact: Optional[str] = None, broker_company: Optional[str] = None,
+    status: Optional[str] = None, source_chat: Optional[str] = None, source_sender: Optional[str] = None,
+    source_date: Optional[str] = None, raw_text: Optional[str] = None, note: Optional[str] = None,
+) -> dict:
+    """Log one vessel offer / position seen in a WhatsApp chat (SHIPS OFFERS & UPDATES,
+    Fixing Team, a personal contact, etc.) so any later search — here or in another chat —
+    can find it, instead of the message only living inside this one conversation.
+
+    You (the calling chat) should already have read and understood the WhatsApp message —
+    pass the fields you extracted from it directly; don't just pass raw_text and expect
+    server-side parsing. Leave a field out (None) if the message didn't give it rather than
+    guessing. raw_text is still worth passing for provenance/audit even though you parsed it
+    yourself. region must be one of: "Danube inside", "Sulina", "Black Sea", "Marmara",
+    "Aegean", "E.Med", "C.Med", "Other". status defaults to "open" if not given
+    (one of: open, on_subs, fixed, withdrawn, expired).
+
+    Matching/dedup: if imo is given, this upserts by IMO (the same vessel re-listed with a
+    newer date updates the existing row instead of duplicating it). Otherwise it upserts by
+    a composite of name + dwt + build_year. If BOTH name and imo are missing (e.g. a
+    "cargo-seeking tonnage" request with no vessel named), a new row is always inserted —
+    there's nothing reliable to match it against.
+
+    IMPORTANT: a WhatsApp listing is not a confirmed open vessel any more than an AIS sighting
+    is — always say so when relaying results, and prefer confirming with the broker/owner
+    before treating it as a firm candidate. restrictions (no UKR/RUS, Sulina-only, etc.) is
+    often the single detail that rules a vessel out, so always surface it when present."""
+    fields = {
+        "name": name, "imo": imo, "mmsi": mmsi, "build_year": build_year, "flag": flag, "dwt": dwt,
+        "dwcc": dwcc, "intake_mt": intake_mt, "grain_cbft": grain_cbft, "bale_cbft": bale_cbft,
+        "draft_m": draft_m, "holds": holds, "gear": gear, "position": position, "region": region,
+        "open_from": open_from, "open_to": open_to, "restrictions": restrictions,
+        "freight_idea": freight_idea, "contact": contact, "broker_company": broker_company,
+        "status": status, "source_chat": source_chat, "source_sender": source_sender,
+        "source_date": source_date, "raw_text": raw_text, "note": note,
+    }
+    async with SessionLocal() as db:
+        row = await upsert_wa_vessel(db, fields)
+        await db.commit()
+    return row
+
+
+@mcp_server.tool()
+async def list_wa_vessels(
+    status: Optional[str] = None, region: Optional[str] = None, dwt_min: Optional[float] = None,
+    dwt_max: Optional[float] = None, max_draft: Optional[float] = None, open_before: Optional[str] = None,
+    inside_danube: Optional[bool] = None,
+) -> dict:
+    """List logged WhatsApp vessel offers/positions, optionally filtered.
+    status: one of open/on_subs/fixed/withdrawn/expired (default: all). region: one of
+    "Danube inside", "Sulina", "Black Sea", "Marmara", "Aegean", "E.Med", "C.Med", "Other".
+    dwt_min/dwt_max: deadweight range. max_draft: only vessels with draft_m <= this (metres).
+    open_before: only vessels open by this date (YYYY-MM-DD) — compares against open_from.
+    inside_danube=True: shortcut for region="Danube inside". Each result includes
+    source_date and raw_text so you can judge how fresh/reliable it is, and restrictions
+    (the usual deal-breaker field). This is a WhatsApp listing, not a confirmed open
+    vessel — treat it the same way as an AIS sighting: a lead to confirm, not a fact."""
+    async with SessionLocal() as db:
+        await wa_sweep_expired(db)
+        await db.commit()
+        rows = await wa_query(
+            db, status=status, region=region, dwt_min=dwt_min, dwt_max=dwt_max,
+            max_draft=max_draft, open_before=open_before, inside_danube=inside_danube,
+        )
+    return {"vessels": rows, "total": len(rows)}
+
+
+@mcp_server.tool()
+async def get_wa_vessel(imo: Optional[str] = None, name: Optional[str] = None) -> dict:
+    """Look up one logged WhatsApp vessel entry by IMO (preferred) or by name. Returns the
+    most recently updated matching row, including source_date/raw_text and restrictions."""
+    if not imo and not name:
+        return {"error": "give imo or name"}
+    async with SessionLocal() as db:
+        await wa_sweep_expired(db)
+        await db.commit()
+        if imo:
+            row = (await db.execute(
+                text("SELECT * FROM wa_vessels WHERE imo=:imo ORDER BY updated_at DESC LIMIT 1"), {"imo": str(imo)}
+            )).first()
+        else:
+            row = (await db.execute(
+                text("SELECT * FROM wa_vessels WHERE name LIKE :n ORDER BY updated_at DESC LIMIT 1"),
+                {"n": f"%{name}%"},
+            )).first()
+    if not row:
+        return {"error": "no matching WhatsApp vessel entry"}
+    return _wa_row_to_dict(row)
+
+
+@mcp_server.tool()
+async def update_wa_vessel(
+    id: str, name: Optional[str] = None, imo: Optional[str] = None, mmsi: Optional[str] = None,
+    build_year: Optional[int] = None, flag: Optional[str] = None, dwt: Optional[float] = None,
+    dwcc: Optional[float] = None, intake_mt: Optional[float] = None, grain_cbft: Optional[float] = None,
+    bale_cbft: Optional[float] = None, draft_m: Optional[float] = None, holds: Optional[str] = None,
+    gear: Optional[str] = None, position: Optional[str] = None, region: Optional[str] = None,
+    open_from: Optional[str] = None, open_to: Optional[str] = None, restrictions: Optional[str] = None,
+    freight_idea: Optional[str] = None, contact: Optional[str] = None, broker_company: Optional[str] = None,
+    status: Optional[str] = None, note: Optional[str] = None,
+) -> dict:
+    """Update one logged WhatsApp vessel entry by id (from list_wa_vessels/get_wa_vessel/
+    add_wa_vessel's returned row) — most often just a status change (e.g. status="on_subs"
+    or status="fixed" once you hear it went). Only pass the fields you want to change; the
+    rest are left as-is. There is no delete — a bad or superseded entry should get
+    status="withdrawn" instead, never removed."""
+    fields = {
+        "name": name, "imo": imo, "mmsi": mmsi, "build_year": build_year, "flag": flag, "dwt": dwt,
+        "dwcc": dwcc, "intake_mt": intake_mt, "grain_cbft": grain_cbft, "bale_cbft": bale_cbft,
+        "draft_m": draft_m, "holds": holds, "gear": gear, "position": position, "region": region,
+        "open_from": open_from, "open_to": open_to, "restrictions": restrictions,
+        "freight_idea": freight_idea, "contact": contact, "broker_company": broker_company,
+        "status": status, "note": note,
+    }
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if not fields:
+        return {"error": "nothing to update"}
+    async with SessionLocal() as db:
+        row = await wa_update_by_id(db, id, fields)
+        await db.commit()
+        if row is None:
+            return {"error": f"no WhatsApp vessel entry with id {id}"}
+    return row
 
 
 mcp_asgi_app = mcp_server.streamable_http_app()
@@ -1759,3 +1929,278 @@ async def delete_lion_position(row_id: str, username: str = Depends(get_current_
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Row not found")
     return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WA vessels ("CGL WA PS" tab) — vessel offers/positions that only ever show
+# up in WhatsApp chats (SHIPS OFFERS & UPDATES, Fixing Team, personal
+# contacts), never in email or AIS. One row = one offer/sighting. Unlike
+# Lion SP (which purges stale rows), these are NEVER deleted — only their
+# status changes, including the automatic "expired" sweep below — so the
+# history of what was offered stays queryable.
+# ══════════════════════════════════════════════════════════════════════════
+
+WA_REGIONS = ["Danube inside", "Sulina", "Black Sea", "Marmara", "Aegean", "E.Med", "C.Med", "Other"]
+WA_STATUSES = ["open", "on_subs", "fixed", "withdrawn", "expired"]
+WA_STALE_DAYS = 20  # open_to (or open_from if no open_to) this many days in the past -> auto status "expired"
+
+WA_FIELDS = [
+    "name", "imo", "mmsi", "build_year", "flag", "dwt", "dwcc", "intake_mt", "grain_cbft",
+    "bale_cbft", "draft_m", "holds", "gear", "position", "region", "open_from", "open_to",
+    "restrictions", "freight_idea", "contact", "broker_company", "status", "source_chat",
+    "source_sender", "source_date", "raw_text", "note",
+]
+
+
+def _wa_row_to_dict(row) -> dict:
+    d = {"id": row.id, "created_at": row.created_at, "updated_at": row.updated_at}
+    for f in WA_FIELDS:
+        d[f] = getattr(row, f)
+    return d
+
+
+def wa_match_key(imo, name, dwt, build_year):
+    """IMO is the reliable key when present. Otherwise fall back to a composite
+    of normalized name + dwt (rounded to the nearest 1000t, to tolerate a
+    figure quoted slightly differently across messages) + build year. If
+    BOTH name and imo are absent (e.g. a cargo-seeking-tonnage request with no
+    vessel named), there is nothing to match against — return None, meaning
+    "always insert a new row, never try to upsert"."""
+    imo = str(imo).strip() if imo else ""
+    if imo:
+        return "imo:" + imo
+    name_key = lion_name_key(name) if name else ""
+    if not name_key:
+        return None
+    dwt_r = ""
+    if dwt not in (None, ""):
+        try:
+            dwt_r = str(round(float(dwt) / 1000) * 1000)
+        except (TypeError, ValueError):
+            dwt_r = ""
+    year = ""
+    if build_year not in (None, ""):
+        try:
+            year = str(int(build_year))
+        except (TypeError, ValueError):
+            year = ""
+    return f"name:{name_key}:{dwt_r}:{year}"
+
+
+async def wa_sweep_expired(db):
+    """Lazy auto-expiry, run on every read: never deletes a row, just flips
+    status to 'expired' once it's well past its open window — and only for
+    rows still at the default 'open' status. A row anyone has manually moved
+    to on_subs/fixed/withdrawn (or expired) is left alone — a manual status
+    is a deliberate decision and a stale date must never silently overwrite
+    it (e.g. a vessel put 'on_subs' days ago must not flip back to 'expired'
+    just because its original open window has since passed)."""
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=WA_STALE_DAYS)).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        text(
+            "UPDATE wa_vessels SET status='expired', updated_at=:now "
+            "WHERE status='open' AND COALESCE(open_to, open_from) IS NOT NULL "
+            "AND COALESCE(open_to, open_from) < :cutoff"
+        ),
+        {"cutoff": cutoff, "now": now},
+    )
+
+
+async def upsert_wa_vessel(db, fields: dict) -> dict:
+    """Shared by the REST 'save draft' endpoint and the add_wa_vessel MCP tool.
+    fields may have None for anything not known — those are simply not written
+    (an update never blanks out a previously-known field with None; to clear a
+    field on purpose use update_wa_vessel/PUT with an explicit empty string).
+    Matches by wa_match_key(); a match updates that row in place (the newer
+    message's fields win, so the same vessel re-listed over several days
+    collapses into one current row instead of duplicating); no match inserts a
+    new row. A fresh sighting of a vessel previously marked 'expired' revives
+    it to 'open' unless the caller passed an explicit status."""
+    key = wa_match_key(fields.get("imo"), fields.get("name"), fields.get("dwt"), fields.get("build_year"))
+    now = datetime.now(timezone.utc).isoformat()
+    existing = None
+    if key:
+        existing = (await db.execute(
+            text("SELECT * FROM wa_vessels WHERE match_key=:k ORDER BY updated_at DESC LIMIT 1"), {"k": key}
+        )).first()
+
+    if existing:
+        merged = {f: getattr(existing, f) for f in WA_FIELDS}
+        for f in WA_FIELDS:
+            if fields.get(f) is not None:
+                merged[f] = fields[f]
+        if fields.get("status") is None and merged["status"] == "expired":
+            merged["status"] = "open"  # reappeared -> treat as live again unless told otherwise
+        params = dict(merged)
+        params["id"] = existing.id
+        params["now"] = now
+        params["match_key"] = key
+        set_clause = ", ".join(f"{f}=:{f}" for f in WA_FIELDS) + ", updated_at=:now, match_key=:match_key"
+        await db.execute(text(f"UPDATE wa_vessels SET {set_clause} WHERE id=:id"), params)
+        row = (await db.execute(text("SELECT * FROM wa_vessels WHERE id=:id"), {"id": existing.id})).first()
+        return _wa_row_to_dict(row)
+
+    new_id = secrets.token_hex(12)
+    params = {f: fields.get(f) for f in WA_FIELDS}
+    params["status"] = params.get("status") or "open"
+    params["id"] = new_id
+    params["now"] = now
+    params["match_key"] = key
+    cols = ["id", "created_at", "updated_at", "match_key"] + WA_FIELDS
+    placeholders = ["id", "now", "now", "match_key"] + WA_FIELDS
+    await db.execute(
+        text(f"INSERT INTO wa_vessels ({', '.join(cols)}) VALUES ({', '.join(':' + p for p in placeholders)})"),
+        params,
+    )
+    row = (await db.execute(text("SELECT * FROM wa_vessels WHERE id=:id"), {"id": new_id})).first()
+    return _wa_row_to_dict(row)
+
+
+async def wa_update_by_id(db, row_id: str, fields: dict):
+    """Direct edit by id (not match-key upsert) — used for explicit edits
+    including status changes. Returns the updated row dict, or None if the
+    id doesn't exist."""
+    fields = {k: v for k, v in fields.items() if k in WA_FIELDS and v is not None}
+    if not fields:
+        row = (await db.execute(text("SELECT * FROM wa_vessels WHERE id=:id"), {"id": row_id})).first()
+        return _wa_row_to_dict(row) if row else None
+    now = datetime.now(timezone.utc).isoformat()
+    params = dict(fields)
+    params["id"] = row_id
+    params["now"] = now
+    if "name" in fields or "imo" in fields or "dwt" in fields or "build_year" in fields:
+        current = (await db.execute(text("SELECT * FROM wa_vessels WHERE id=:id"), {"id": row_id})).first()
+        if current is None:
+            return None
+        merged = {f: getattr(current, f) for f in WA_FIELDS}
+        merged.update(fields)
+        params["match_key"] = wa_match_key(merged["imo"], merged["name"], merged["dwt"], merged["build_year"])
+        set_clause = ", ".join(f"{f}=:{f}" for f in fields) + ", updated_at=:now, match_key=:match_key"
+    else:
+        set_clause = ", ".join(f"{f}=:{f}" for f in fields) + ", updated_at=:now"
+    result = await db.execute(text(f"UPDATE wa_vessels SET {set_clause} WHERE id=:id"), params)
+    if result.rowcount == 0:
+        return None
+    row = (await db.execute(text("SELECT * FROM wa_vessels WHERE id=:id"), {"id": row_id})).first()
+    return _wa_row_to_dict(row)
+
+
+async def wa_query(db, status=None, region=None, dwt_min=None, dwt_max=None, max_draft=None,
+                    open_before=None, inside_danube=None):
+    clauses, params = [], {}
+    if inside_danube:
+        clauses.append("region = :region_danube")
+        params["region_danube"] = "Danube inside"
+    elif region:
+        clauses.append("region = :region")
+        params["region"] = region
+    if status:
+        clauses.append("status = :status")
+        params["status"] = status
+    if dwt_min is not None:
+        clauses.append("dwt >= :dwt_min")
+        params["dwt_min"] = dwt_min
+    if dwt_max is not None:
+        clauses.append("dwt <= :dwt_max")
+        params["dwt_max"] = dwt_max
+    if max_draft is not None:
+        clauses.append("draft_m <= :max_draft")
+        params["max_draft"] = max_draft
+    if open_before:
+        clauses.append("open_from <= :open_before")
+        params["open_before"] = open_before
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = (await db.execute(text(f"SELECT * FROM wa_vessels {where} ORDER BY updated_at DESC"), params)).all()
+    return [_wa_row_to_dict(r) for r in rows]
+
+
+class WaVesselBody(BaseModel):
+    name: Optional[str] = None
+    imo: Optional[str] = None
+    mmsi: Optional[str] = None
+    build_year: Optional[int] = None
+    flag: Optional[str] = None
+    dwt: Optional[float] = None
+    dwcc: Optional[float] = None
+    intake_mt: Optional[float] = None
+    grain_cbft: Optional[float] = None
+    bale_cbft: Optional[float] = None
+    draft_m: Optional[float] = None
+    holds: Optional[str] = None
+    gear: Optional[str] = None
+    position: Optional[str] = None
+    region: Optional[str] = None
+    open_from: Optional[str] = None
+    open_to: Optional[str] = None
+    restrictions: Optional[str] = None
+    freight_idea: Optional[str] = None
+    contact: Optional[str] = None
+    broker_company: Optional[str] = None
+    status: Optional[str] = None
+    source_chat: Optional[str] = None
+    source_sender: Optional[str] = None
+    source_date: Optional[str] = None
+    raw_text: Optional[str] = None
+    note: Optional[str] = None
+
+
+class WaVesselUpdateBody(BaseModel):
+    name: Optional[str] = None
+    imo: Optional[str] = None
+    mmsi: Optional[str] = None
+    build_year: Optional[int] = None
+    flag: Optional[str] = None
+    dwt: Optional[float] = None
+    dwcc: Optional[float] = None
+    intake_mt: Optional[float] = None
+    grain_cbft: Optional[float] = None
+    bale_cbft: Optional[float] = None
+    draft_m: Optional[float] = None
+    holds: Optional[str] = None
+    gear: Optional[str] = None
+    position: Optional[str] = None
+    region: Optional[str] = None
+    open_from: Optional[str] = None
+    open_to: Optional[str] = None
+    restrictions: Optional[str] = None
+    freight_idea: Optional[str] = None
+    contact: Optional[str] = None
+    broker_company: Optional[str] = None
+    status: Optional[str] = None
+    note: Optional[str] = None
+
+
+@app.get("/api/wa-vessels")
+async def list_wa_vessels_rest(
+    status: Optional[str] = None, region: Optional[str] = None, dwt_min: Optional[float] = None,
+    dwt_max: Optional[float] = None, max_draft: Optional[float] = None, open_before: Optional[str] = None,
+    inside_danube: Optional[bool] = None, username: str = Depends(get_current_username),
+):
+    async with SessionLocal() as db:
+        await wa_sweep_expired(db)
+        await db.commit()
+        rows = await wa_query(db, status=status, region=region, dwt_min=dwt_min, dwt_max=dwt_max,
+                               max_draft=max_draft, open_before=open_before, inside_danube=inside_danube)
+    return {"vessels": rows, "regions": WA_REGIONS, "statuses": WA_STATUSES}
+
+
+@app.post("/api/wa-vessels")
+async def create_wa_vessel(body: WaVesselBody, username: str = Depends(get_current_username)):
+    """Save a reviewed draft row from the "paste a WhatsApp message" box (after the
+    frontend's own AI-parse step). Upserts by match key — see upsert_wa_vessel."""
+    async with SessionLocal() as db:
+        row = await upsert_wa_vessel(db, body.dict())
+        await db.commit()
+    return row
+
+
+@app.put("/api/wa-vessels/{row_id}")
+async def update_wa_vessel_rest(row_id: str, body: WaVesselUpdateBody, username: str = Depends(get_current_username)):
+    fields = body.dict(exclude_unset=True)
+    async with SessionLocal() as db:
+        row = await wa_update_by_id(db, row_id, fields)
+        await db.commit()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Row not found")
+    return row
