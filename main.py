@@ -970,6 +970,10 @@ async def add_wa_vessel(
     "cargo-seeking tonnage" request with no vessel named), a new row is always inserted —
     there's nothing reliable to match it against.
 
+    Put hard limits in restrictions (no UKR/RUS, Sulina only...) and every other useful detail
+    from the message (free days, demurrage, "ready via Bystroe", laycan notes, owner's terms)
+    in note, and any rate talk in freight_idea — they are searchable later via list_wa_vessels(q=...).
+
     IMPORTANT: a WhatsApp listing is not a confirmed open vessel any more than an AIS sighting
     is — always say so when relaying results, and prefer confirming with the broker/owner
     before treating it as a firm candidate. restrictions (no UKR/RUS, Sulina-only, etc.) is
@@ -993,9 +997,14 @@ async def add_wa_vessel(
 async def list_wa_vessels(
     status: Optional[str] = None, region: Optional[str] = None, dwt_min: Optional[float] = None,
     dwt_max: Optional[float] = None, max_draft: Optional[float] = None, open_before: Optional[str] = None,
-    inside_danube: Optional[bool] = None,
+    inside_danube: Optional[bool] = None, q: Optional[str] = None,
 ) -> dict:
     """List logged WhatsApp vessel offers/positions, optionally filtered.
+    q: free-text search — every word must appear (case-insensitive) in the vessel's name, IMO,
+    position, restrictions, freight_idea, note, contact or the original WhatsApp message, e.g.
+    q="bystroe" or q="no ukr". ALWAYS read each result's restrictions, note and freight_idea
+    (and raw_text when in doubt) before suggesting a vessel — details like "Sulina only",
+    free days, or "ready via Bystroe" live there, not in dedicated fields.
     status: one of open/on_subs/fixed/withdrawn/expired (default: all). region: one of
     "Danube inside", "Sulina", "Black Sea", "Marmara", "Aegean", "E.Med", "C.Med", "Other".
     dwt_min/dwt_max: deadweight range. max_draft: only vessels with draft_m <= this (metres).
@@ -1009,7 +1018,7 @@ async def list_wa_vessels(
         await db.commit()
         rows = await wa_query(
             db, status=status, region=region, dwt_min=dwt_min, dwt_max=dwt_max,
-            max_draft=max_draft, open_before=open_before, inside_danube=inside_danube,
+            max_draft=max_draft, open_before=open_before, inside_danube=inside_danube, q=q,
         )
     return {"vessels": rows, "total": len(rows)}
 
@@ -2086,9 +2095,21 @@ async def wa_update_by_id(db, row_id: str, fields: dict):
     return _wa_row_to_dict(row)
 
 
+WA_TEXT_COLUMNS = ("name", "imo", "flag", "holds", "gear", "position", "region", "restrictions",
+                   "freight_idea", "contact", "broker_company", "note", "raw_text")
+
+
 async def wa_query(db, status=None, region=None, dwt_min=None, dwt_max=None, max_draft=None,
-                    open_before=None, inside_danube=None):
+                    open_before=None, inside_danube=None, q=None):
     clauses, params = [], {}
+    # Free-text search: every whitespace-separated word must appear (case-insensitive)
+    # somewhere in the descriptive columns — including restrictions, note, freight_idea
+    # and the original message — so things like "bystroe" or "free days" are findable
+    # even though they aren't dedicated fields.
+    for i, term in enumerate((q or "").split()):
+        key = f"q{i}"
+        clauses.append("(" + " OR ".join(f"COALESCE({c},'') LIKE :{key} ESCAPE '\\'" for c in WA_TEXT_COLUMNS) + ")")
+        params[key] = "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     if inside_danube:
         clauses.append("region = :region_danube")
         params["region_danube"] = "Danube inside"
@@ -2175,13 +2196,14 @@ class WaVesselUpdateBody(BaseModel):
 async def list_wa_vessels_rest(
     status: Optional[str] = None, region: Optional[str] = None, dwt_min: Optional[float] = None,
     dwt_max: Optional[float] = None, max_draft: Optional[float] = None, open_before: Optional[str] = None,
-    inside_danube: Optional[bool] = None, username: str = Depends(get_current_username),
+    inside_danube: Optional[bool] = None, q: Optional[str] = None,
+    username: str = Depends(get_current_username),
 ):
     async with SessionLocal() as db:
         await wa_sweep_expired(db)
         await db.commit()
         rows = await wa_query(db, status=status, region=region, dwt_min=dwt_min, dwt_max=dwt_max,
-                               max_draft=max_draft, open_before=open_before, inside_danube=inside_danube)
+                               max_draft=max_draft, open_before=open_before, inside_danube=inside_danube, q=q)
     return {"vessels": rows, "regions": WA_REGIONS, "statuses": WA_STATUSES}
 
 
