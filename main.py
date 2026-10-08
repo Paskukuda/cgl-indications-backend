@@ -2066,11 +2066,11 @@ async def upsert_wa_vessel(db, fields: dict) -> dict:
     return _wa_row_to_dict(row)
 
 
-async def wa_update_by_id(db, row_id: str, fields: dict):
+async def wa_update_by_id(db, row_id: str, fields: dict, allow_null: bool = False):
     """Direct edit by id (not match-key upsert) — used for explicit edits
     including status changes. Returns the updated row dict, or None if the
     id doesn't exist."""
-    fields = {k: v for k, v in fields.items() if k in WA_FIELDS and v is not None}
+    fields = {k: v for k, v in fields.items() if k in WA_FIELDS and (allow_null or v is not None)}
     if not fields:
         row = (await db.execute(text("SELECT * FROM wa_vessels WHERE id=:id"), {"id": row_id})).first()
         return _wa_row_to_dict(row) if row else None
@@ -2221,7 +2221,7 @@ async def create_wa_vessel(body: WaVesselBody, username: str = Depends(get_curre
 async def update_wa_vessel_rest(row_id: str, body: WaVesselUpdateBody, username: str = Depends(get_current_username)):
     fields = body.dict(exclude_unset=True)
     async with SessionLocal() as db:
-        row = await wa_update_by_id(db, row_id, fields)
+        row = await wa_update_by_id(db, row_id, fields, allow_null=True)
         await db.commit()
         if row is None:
             raise HTTPException(status_code=404, detail="Row not found")
